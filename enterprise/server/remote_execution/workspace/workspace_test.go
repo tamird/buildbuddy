@@ -2,6 +2,7 @@ package workspace_test
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -19,6 +20,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testfs"
 	"github.com/buildbuddy-io/buildbuddy/server/util/fspath"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -732,5 +734,192 @@ func TestDownloadInputs_VFSPrefetchMode(t *testing.T) {
 				require.ErrorIs(t, err, os.ErrNotExist)
 			}
 		})
+	}
+}
+
+func TestPool_ReusedWorkspaceMatchesFreshSetup(t *testing.T) {
+	flags.Set(t, "executor.workspace_reuse_pool_size", 4)
+	te := testenv.GetTestEnv(t)
+	_, runServer, lis := testenv.RegisterLocalGRPCServer(t, te)
+	testcache.Setup(t, te, lis)
+	go runServer()
+	fc, err := filecache.NewFileCache(testfs.MakeTempDir(t), 1e9, false)
+	require.NoError(t, err)
+	fc.WaitForDirectoryScanToComplete()
+	te.SetFileCache(fc)
+	ctx := t.Context()
+
+	file := func(name, content string) *repb.FileNode {
+		d, err := cachetools.UploadBlob(ctx, te.GetByteStreamClient(), "", repb.DigestFunction_SHA256, strings.NewReader(content))
+		require.NoError(t, err)
+		return &repb.FileNode{Name: name, Digest: d}
+	}
+	dirNode := func(name string, dir *repb.Directory) *repb.DirectoryNode {
+		d, err := cachetools.UploadProto(ctx, te.GetByteStreamClient(), "", repb.DigestFunction_SHA256, dir)
+		require.NoError(t, err)
+		return &repb.DirectoryNode{Name: name, Digest: d}
+	}
+	pkg := &repb.Directory{Files: []*repb.FileNode{file("index.js", "index")}}
+	nodeModules := &repb.Directory{
+		Directories: []*repb.DirectoryNode{dirNode("pkg", pkg)},
+		Symlinks:    []*repb.SymlinkNode{{Name: "link", Target: "pkg"}},
+	}
+	out := &repb.Directory{}
+	bin := &repb.Directory{
+		Files:       []*repb.FileNode{file("gen.js", "gen")},
+		Directories: []*repb.DirectoryNode{dirNode("out", out)},
+	}
+	oldOnly := &repb.Directory{Files: []*repb.FileNode{file("stale.txt", "stale")}}
+	oldTree := &repb.Tree{
+		Root: &repb.Directory{
+			Files:       []*repb.FileNode{file("keep.txt", "keep")},
+			Directories: []*repb.DirectoryNode{dirNode("bin", bin), dirNode("node_modules", nodeModules), dirNode("old_only", oldOnly)},
+		},
+		Children: []*repb.Directory{bin, out, nodeModules, pkg, oldOnly},
+	}
+	newTree := &repb.Tree{
+		Root: &repb.Directory{
+			Files:       []*repb.FileNode{file("keep.txt", "keep"), file("new.txt", "new")},
+			Directories: []*repb.DirectoryNode{dirNode("bin", bin), dirNode("node_modules", nodeModules)},
+		},
+		Children: []*repb.Directory{bin, out, nodeModules, pkg},
+	}
+	cmd := &repb.Command{
+		OutputDirectories: []string{"bin/out"},
+		OutputFiles:       []string{"bin/result.txt", "made/by/task/result.txt"},
+	}
+	setUp := func(ws *workspace.Workspace, tree *repb.Tree) {
+		ws.SetTask(ctx, &repb.ExecutionTask{Command: cmd})
+		require.NoError(t, ws.CreateOutputDirs())
+		require.NoError(t, ws.DownloadInputs(ctx, &container.FileSystemLayout{DigestFunction: repb.DigestFunction_SHA256, Inputs: tree}))
+		_, err := ws.TaskFinished()
+		require.NoError(t, err)
+	}
+	snapshot := func(root string) map[string]string {
+		entries := map[string]string{}
+		err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+			require.NoError(t, err)
+			rel, err := filepath.Rel(root, path)
+			require.NoError(t, err)
+			info, err := os.Lstat(path)
+			require.NoError(t, err)
+			switch {
+			case info.Mode()&fs.ModeSymlink != 0:
+				target, err := os.Readlink(path)
+				require.NoError(t, err)
+				entries[rel] = "symlink to " + target
+			case info.IsDir():
+				entries[rel] = info.Mode().String()
+			default:
+				content, err := os.ReadFile(path)
+				require.NoError(t, err)
+				entries[rel] = info.Mode().String() + " " + string(content)
+			}
+			return nil
+		})
+		require.NoError(t, err)
+		return entries
+	}
+	write := func(t *testing.T, path, content string) {
+		require.NoError(t, os.WriteFile(path, []byte(content), 0644))
+	}
+
+	for _, test := range []struct {
+		name string
+		// task changes the first workspace as its task would.
+		task func(t *testing.T, root string)
+	}{
+		{
+			name: "unchanged",
+			task: func(t *testing.T, root string) {},
+		},
+		{
+			name: "outputs",
+			task: func(t *testing.T, root string) {
+				write(t, filepath.Join(root, "bin/result.txt"), "result")
+				write(t, filepath.Join(root, "bin/out/a.txt"), "a")
+				write(t, filepath.Join(root, "made/by/task/result.txt"), "result")
+			},
+		},
+		{
+			name: "input replaced",
+			task: func(t *testing.T, root string) {
+				require.NoError(t, os.Remove(filepath.Join(root, "keep.txt")))
+				write(t, filepath.Join(root, "keep.txt"), "changed")
+			},
+		},
+		{
+			name: "input deleted",
+			task: func(t *testing.T, root string) {
+				require.NoError(t, os.Remove(filepath.Join(root, "bin/gen.js")))
+			},
+		},
+		{
+			name: "file added to nested input directory",
+			task: func(t *testing.T, root string) {
+				write(t, filepath.Join(root, "node_modules/pkg/stray.js"), "stray")
+			},
+		},
+		{
+			name: "input directory replaced by symlink",
+			task: func(t *testing.T, root string) {
+				elsewhere := filepath.Join(testfs.MakeTempDir(t), "pkg")
+				require.NoError(t, os.Rename(filepath.Join(root, "node_modules/pkg"), elsewhere))
+				write(t, filepath.Join(elsewhere, "stray.js"), "stray")
+				require.NoError(t, os.Symlink(elsewhere, filepath.Join(root, "node_modules/pkg")))
+			},
+		},
+		{
+			name: "input directory replaced by new directory",
+			task: func(t *testing.T, root string) {
+				require.NoError(t, os.Rename(filepath.Join(root, "bin"), filepath.Join(root, "bin2")))
+				require.NoError(t, os.Mkdir(filepath.Join(root, "bin"), 0755))
+			},
+		},
+		{
+			name: "symlink retargeted",
+			task: func(t *testing.T, root string) {
+				require.NoError(t, os.Remove(filepath.Join(root, "node_modules/link")))
+				require.NoError(t, os.Symlink("elsewhere", filepath.Join(root, "node_modules/link")))
+			},
+		},
+		{
+			name: "input directory made read-only",
+			task: func(t *testing.T, root string) {
+				require.NoError(t, os.Chmod(filepath.Join(root, "node_modules/pkg"), 0555))
+			},
+		},
+	} {
+		// A 4 byte limit removes the 5 byte inputs before pooling, which the
+		// next task then links again.
+		for _, maxFileSize := range []int64{0, 4} {
+			t.Run(fmt.Sprintf("%s/max_file_size=%d", test.name, maxFileSize), func(t *testing.T) {
+				flags.Set(t, "executor.workspace_reuse_max_file_size_bytes", maxFileSize)
+				buildRoot := testfs.MakeTempDir(t)
+				pool, err := workspace.NewPool(buildRoot)
+				require.NoError(t, err)
+				opts := &workspace.Opts{Pool: pool}
+				first, err := workspace.New(te, buildRoot, opts)
+				require.NoError(t, err)
+				setUp(first, oldTree)
+				test.task(t, first.Path())
+				first.ReturnToPool(ctx)
+				require.NoError(t, first.Remove(ctx))
+
+				second, err := workspace.New(te, buildRoot, opts)
+				require.NoError(t, err)
+				setUp(second, newTree)
+				fresh, err := workspace.New(te, testfs.MakeTempDir(t), &workspace.Opts{})
+				require.NoError(t, err)
+				setUp(fresh, newTree)
+
+				pooled, err := os.ReadDir(filepath.Join(buildRoot, ".workspace-reuse-pool"))
+				require.NoError(t, err)
+				assert.Empty(t, pooled, "second workspace should have reused the pooled one")
+				want := snapshot(fresh.Path())
+				got := snapshot(second.Path())
+				assert.Equal(t, want, got)
+			})
+		}
 	}
 }

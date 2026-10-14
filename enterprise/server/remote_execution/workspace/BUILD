@@ -6,11 +6,14 @@ go_library(
     name = "workspace",
     srcs = [
         "workspace.go",
+        "workspace_linux.go",
+        "workspace_notlinux.go",
         "workspace_unix.go",
         "workspace_windows.go",
     ],
     importpath = "github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/workspace",
     deps = [
+        "//enterprise/server/auth",
         "//enterprise/server/cmd/ci_runner/bundle",
         "//enterprise/server/remote_execution/container",
         "//enterprise/server/remote_execution/execution_experiments",
@@ -28,6 +31,7 @@ go_library(
         "//server/util/disk",
         "//server/util/flag",
         "//server/util/fspath",
+        "//server/util/gds",
         "//server/util/log",
         "//server/util/platform",
         "//server/util/status",
@@ -41,6 +45,7 @@ go_library(
         ],
         "@io_bazel_rules_go//go/platform:linux": [
             "@com_github_google_uuid//:uuid",
+            "@org_golang_x_sys//unix",
         ],
         "//conditions:default": [],
     }),
@@ -61,6 +66,7 @@ go_test(
         "//server/testutil/testfs",
         "//server/util/fspath",
         "//server/util/status",
+        "//server/util/testing/flags",
         "@com_github_stretchr_testify//assert",
         "@com_github_stretchr_testify//require",
     ],

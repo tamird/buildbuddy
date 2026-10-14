@@ -20,6 +20,7 @@ go_library(
         "//enterprise/server/remote_execution/container",
         "//enterprise/server/remote_execution/executor/oomkiller",
         "//enterprise/server/remote_execution/executorplatform",
+        "//enterprise/server/remote_execution/filecache",
         "//enterprise/server/remote_execution/oom",
         "//enterprise/server/remote_execution/persistentworker",
         "//enterprise/server/remote_execution/snaputil",

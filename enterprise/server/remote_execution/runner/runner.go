@@ -25,6 +25,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/container"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/executor/oomkiller"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/executorplatform"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/filecache"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/oom"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/persistentworker"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/snaputil"
@@ -671,6 +672,8 @@ func (r *taskRunner) Remove(ctx context.Context) error {
 	}
 	if err := r.Container.Remove(ctx); err != nil {
 		errs = append(errs, err)
+	} else {
+		r.Workspace.ReturnToPool(ctx)
 	}
 	if err := r.Workspace.Remove(ctx); err != nil {
 		errs = append(errs, err)
@@ -742,6 +745,9 @@ type pool struct {
 	overrideProvider   container.Provider
 	oomKiller          oomkiller.Killer
 	containerProviders map[platform.ContainerType]container.Provider
+	// workspacePool holds finished tasks' workspaces for reuse, or is
+	// nil if workspace reuse is disabled.
+	workspacePool *workspace.Pool
 
 	maxRunnerCount                 int
 	maxTotalRunnerMemoryUsageBytes int64
@@ -793,6 +799,10 @@ func NewPool(env environment.Env, cacheRoot string, opts *PoolOptions) (*pool, e
 	p.caseInsensitiveFS, err = fspath.IsCaseInsensitiveFS(p.buildRoot)
 	if err != nil {
 		return nil, status.InternalErrorf("test build root case sensitivity at path %q: %s", p.buildRoot, err)
+	}
+	p.workspacePool, err = workspace.NewPool(p.buildRoot)
+	if err != nil {
+		return nil, status.InternalErrorf("create workspace reuse pool: %s", err)
 	}
 	if opts.ContainerProvider != nil {
 		p.overrideProvider = opts.ContainerProvider
@@ -1316,6 +1326,21 @@ func (p *pool) newRunner(ctx context.Context, key *rnpb.RunnerKey, props *platfo
 		UseOverlayfs:    useOverlayfs,
 		UseVFS:          useHostVFS,
 		VFSPrefetchMode: vfsPrefetchMode,
+	}
+	// We only pool workspaces if all of these are true:
+	//  - It's a "normal," ephemeral action workspace (non-FUSE, non-overlayfs,
+	//    non-recycled, not preserved).
+	//  - It's a hardlinked workspace, not copy-on-write. Copy-on-write
+	//    workspaces allow actions to modify their inputs without subsequent
+	//    actions seeing those modifications, which workspace pooling does not
+	//    support (for performance reasons).
+	//  - The task isn't anonymous, unless the executor isn't shared. This is
+	//    the same rule as for runner recycling, since on a shared executor,
+	//    unrelated users can send anonymous tasks under one group.
+	if p.workspacePool != nil && !props.RecycleRunner && !props.PreserveWorkspace && !useOverlayfs && !props.EnableVFS &&
+		!filecache.ClonesInputs(ctx) &&
+		(key.GetGroupId() != "" || container.AnonymousRecyclingEnabled()) {
+		wsOpts.Pool = p.workspacePool
 	}
 	ws, err := workspace.New(p.env, p.buildRoot, wsOpts)
 	if err != nil {

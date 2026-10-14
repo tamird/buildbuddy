@@ -1138,6 +1138,14 @@ func (c *fileCache) tempPath(name string) (string, error) {
 	return filepath.Join(c.TempDir(), fmt.Sprintf("%s.%s.tmp", name, randStr)), nil
 }
 
+// ClonesInputs returns whether files linked from the file cache for the given
+// context are copies, rather than hard links to the file cache's own copy, so
+// that actions can modify them without affecting the file cache. It matches
+// cloneOrLink.
+func ClonesInputs(ctx context.Context) bool {
+	return (keyPrefixFromContext(ctx) == interfaces.AuthAnonymousUser || *enableAlwaysClone) && fastcopy.ReflinkingEnabled()
+}
+
 func cloneOrLink(keyPrefix, source, destination string) error {
 	if keyPrefix == interfaces.AuthAnonymousUser || *enableAlwaysClone {
 		if err := fastcopy.Clone(source, destination); err != nil {
