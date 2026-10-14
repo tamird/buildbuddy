@@ -60,9 +60,8 @@ var (
 	vfsLogFUSELatencyStats = flag.Bool("executor.vfs.log_fuse_latency_stats", false, "Enables logging of per-operation latency stats when VFS is unmounted. Implicitly enabled by --executor.vfs.verbose.")
 	vfsLogFUSEPerFileStats = flag.Bool("executor.vfs.log_fuse_per_file_stats", false, "Enables tracking and logging of per-file per-operation stats. Logged when VFS is unmounted.")
 
-	reusePoolSize    = flag.Int("executor.workspace_reuse_pool_size", 0, "Maximum number of finished task workspaces to keep for reuse by later tasks with similar input trees. 0 disables reuse.")
-	reuseMaxBytes    = flag.Int64("executor.workspace_reuse_max_bytes", 0, "Maximum total size of the input files that pooled workspaces hold, counting a file once per path it appears at. 0 means no limit.")
-	reuseMaxFileSize = flag.Int64("executor.workspace_reuse_max_file_size_bytes", 0, "Input files larger than this are removed from a workspace before it enters the reuse pool, so that pooled workspaces don't keep large files on disk after the file cache evicts them. 0 keeps all files.")
+	reusePoolSize    = flag.Int("executor.workspace_reuse.pool_size", 32, "Maximum number of finished task workspaces to keep for reuse by later tasks with similar input trees, when the executor.workspace_reuse.enabled experiment is on. 0 disables reuse.")
+	reuseMaxFileSize = flag.Int64("executor.workspace_reuse.max_file_size_bytes", 1<<20, "Input files larger than this are removed from a workspace before it enters the reuse pool, so that pooled workspaces don't keep large files on disk after the file cache evicts them. This is mostly a hedge against extreme edge cases, since pooled workspaces only hold hard links to file cache entries, and the file cache rarely evicts files that pooled workspaces still use. 0 keeps all files.")
 )
 
 func setDeleteLimit() {
@@ -863,8 +862,6 @@ type Pool struct {
 	mu sync.Mutex // protects all of the fields below
 	// Pooled workspaces, in no particular order.
 	entries []*pooledWorkspace
-	// The total input bytes held by entries.
-	bytes int64
 	// Chooses which entry to evict.
 	eviction *gds.Pool[*pooledWorkspace]
 }
@@ -876,8 +873,6 @@ type pooledWorkspace struct {
 	rootDigest     *repb.Digest
 	dirMap         map[digest.Key]*repb.Directory
 	totalFiles     int
-	// The total size of the input files the workspace holds.
-	bytes int64
 	// Paths of input entries that we removed when the workspace returned to
 	// the pool, because its task changed them. A directory path covers its
 	// whole subtree.
@@ -916,25 +911,6 @@ func countTreeFiles(d *repb.Digest, dirMap map[digest.Key]*repb.Directory, memo 
 	n := len(dir.GetFiles())
 	for _, child := range dir.GetDirectories() {
 		n += countTreeFiles(child.GetDigest(), dirMap, memo)
-	}
-	memo[k] = n
-	return n
-}
-
-// treeBytes returns the total size of the files in the subtree rooted at d,
-// counting a repeated subdirectory once per place it appears.
-func treeBytes(d *repb.Digest, dirMap map[digest.Key]*repb.Directory, memo map[digest.Key]int64) int64 {
-	k := digest.NewKey(d)
-	if n, ok := memo[k]; ok {
-		return n
-	}
-	dir := dirMap[k]
-	var n int64
-	for _, f := range dir.GetFiles() {
-		n += f.GetDigest().GetSizeBytes()
-	}
-	for _, child := range dir.GetDirectories() {
-		n += treeBytes(child.GetDigest(), dirMap, memo)
 	}
 	memo[k] = n
 	return n
@@ -995,31 +971,28 @@ func (p *Pool) take(groupID string, newRoot *repb.Digest, newDirs map[digest.Key
 	}
 	e := p.entries[best]
 	p.entries = slices.Delete(p.entries, best, best+1)
-	p.bytes -= e.bytes
 	p.eviction.Remove(e)
 	return e
 }
 
 // add adds a workspace to the pool, then evicts workspaces until the pool is
-// within its limits, which may evict the new one. It returns the number of
-// workspaces evicted, and the pool's size afterwards.
-func (p *Pool) add(e *pooledWorkspace) (evicted int, workspaces int, bytes int64) {
+// within its size limit, which may evict the new one. It returns the number of
+// workspaces evicted, and the number of pooled workspaces afterwards.
+func (p *Pool) add(e *pooledWorkspace) (evicted int, workspaces int) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.entries = append(p.entries, e)
-	p.bytes += e.bytes
 	// We value a workspace by its file count, since reusing it saves up to
 	// that many links.
 	p.eviction.Add(e, int64(e.totalFiles))
-	for len(p.entries) > *reusePoolSize || (*reuseMaxBytes > 0 && p.bytes > *reuseMaxBytes) {
+	for len(p.entries) > *reusePoolSize {
 		v, ok := p.eviction.Evict()
 		if !ok {
 			break
 		}
 		p.entries = slices.DeleteFunc(p.entries, func(c *pooledWorkspace) bool { return c == v })
-		p.bytes -= v.bytes
 		evicted++
-		log.Infof("Evicted pooled workspace: files=%d bytes=%d new=%t", v.totalFiles, v.bytes, v == e)
+		log.Infof("Evicted pooled workspace: files=%d new=%t", v.totalFiles, v == e)
 		deleteWaitGroup.Go(func() error {
 			if err := disk.ForceRemove(context.Background(), v.path); err != nil {
 				log.Warningf("Failed to remove evicted workspace %q: %s", v.path, err)
@@ -1027,7 +1000,7 @@ func (p *Pool) add(e *pooledWorkspace) (evicted int, workspaces int, bytes int64
 			return nil
 		})
 	}
-	return evicted, len(p.entries), p.bytes
+	return evicted, len(p.entries)
 }
 
 // recordDirFingerprints records the fingerprint of every input directory, so
@@ -1117,17 +1090,12 @@ type returnCheck struct {
 	rejectedExamples, otherExamples                         []string
 	otherByPath                                             map[string]int
 
-	// The size of the input files removed, including large files.
-	removedBytes  int64
-	largeFiles    int
-	treeBytesMemo map[digest.Key]int64
+	largeFiles int
 }
 
-// reject records that the input at rel, holding the given number of bytes,
-// was removed, and why.
-func (c *returnCheck) reject(reason, rel string, bytes int64) {
+// reject records that the input at rel was removed, and why.
+func (c *returnCheck) reject(reason, rel string) {
 	c.missing[rel] = true
-	c.removedBytes += bytes
 	c.rejected[reason]++
 	if len(c.rejectedExamples) < 5 {
 		c.rejectedExamples = append(c.rejectedExamples, reason+": "+rel)
@@ -1156,7 +1124,6 @@ func (ws *Workspace) ReturnToPool(ctx context.Context) {
 		missing:       map[string]bool{},
 		rejected:      map[string]int{},
 		otherByPath:   map[string]int{},
-		treeBytesMemo: map[digest.Key]int64{},
 	}
 	// We check the workspace before renaming it, because renaming the root
 	// directory changes its ctime.
@@ -1184,20 +1151,18 @@ func (ws *Workspace) ReturnToPool(ctx context.Context) {
 			missingAncestors[rel] = true
 		}
 	}
-	bytes := treeBytes(ws.inputRootDigest, ws.inputDirs, c.treeBytesMemo) - c.removedBytes
-	evicted, poolWorkspaces, poolBytes := pool.add(&pooledWorkspace{
+	evicted, poolWorkspaces := pool.add(&pooledWorkspace{
 		groupID:          ws.groupID,
 		path:             pooledPath,
 		digestFunction:   ws.inputDigestFunction,
 		rootDigest:       ws.inputRootDigest,
 		dirMap:           ws.inputDirs,
 		totalFiles:       countTreeFiles(ws.inputRootDigest, ws.inputDirs, map[digest.Key]int{}),
-		bytes:            bytes,
 		missing:          c.missing,
 		missingAncestors: missingAncestors,
 	})
-	log.CtxInfof(ctx, "Workspace returned to reuse pool: dirs=%d changed_dirs=%d read_dirs=%d checked_files=%d removed_inputs=%d removed_non_inputs=%d large_files_removed=%d bytes=%d evicted=%d pool_workspaces=%d pool_bytes=%d duration=%s rejected=[%s] rejected_examples=%q non_input_examples=%q non_inputs_by_path=[%s]",
-		c.dirs, c.changedDirs, c.readDirs, c.checkedFiles, len(c.missing), c.removedOther, c.largeFiles, bytes, evicted, poolWorkspaces, poolBytes, time.Since(start),
+	log.CtxInfof(ctx, "Workspace returned to reuse pool: dirs=%d changed_dirs=%d read_dirs=%d checked_files=%d removed_inputs=%d removed_non_inputs=%d large_files_removed=%d evicted=%d pool_workspaces=%d duration=%s rejected=[%s] rejected_examples=%q non_input_examples=%q non_inputs_by_path=[%s]",
+		c.dirs, c.changedDirs, c.readDirs, c.checkedFiles, len(c.missing), c.removedOther, c.largeFiles, evicted, poolWorkspaces, time.Since(start),
 		topCounts(c.rejected, 5), c.rejectedExamples, c.otherExamples, topCounts(c.otherByPath, 8))
 }
 
@@ -1243,7 +1208,6 @@ func (ws *Workspace) checkReturnedDir(ctx context.Context, rel string, d *repb.D
 				return false, err
 			}
 			c.missing[fileRel] = true
-			c.removedBytes += f.GetDigest().GetSizeBytes()
 			c.largeFiles++
 		}
 	}
@@ -1257,7 +1221,7 @@ func (ws *Workspace) checkReturnedDir(ctx context.Context, rel string, d *repb.D
 			return false, err
 		}
 		if !ok {
-			c.reject("directory replaced", childRel, treeBytes(child.GetDigest(), ws.inputDirs, c.treeBytesMemo))
+			c.reject("directory replaced", childRel)
 			if err := disk.ForceRemove(ctx, filepath.Join(full, child.GetName())); err != nil {
 				return false, err
 			}
@@ -1336,30 +1300,24 @@ func (ws *Workspace) checkReturnedEntries(ctx context.Context, rel string, dir *
 		if reason == "" {
 			continue
 		}
-		var bytes int64
-		if children[name] != nil {
-			bytes = treeBytes(children[name], ws.inputDirs, c.treeBytesMemo)
-		} else if files[name] != nil {
-			bytes = files[name].GetDigest().GetSizeBytes()
-		}
-		c.reject(reason, entryRel, bytes)
+		c.reject(reason, entryRel)
 		if err := disk.ForceRemove(ctx, entryFull); err != nil {
 			return err
 		}
 	}
-	for name, f := range files {
+	for name := range files {
 		if !present[name] {
-			c.reject("file deleted", path.Join(rel, name), f.GetDigest().GetSizeBytes())
+			c.reject("file deleted", path.Join(rel, name))
 		}
 	}
 	for name := range symlinks {
 		if !present[name] {
-			c.reject("symlink deleted", path.Join(rel, name), 0)
+			c.reject("symlink deleted", path.Join(rel, name))
 		}
 	}
-	for name, d := range children {
+	for name := range children {
 		if !present[name] {
-			c.reject("directory deleted", path.Join(rel, name), treeBytes(d, ws.inputDirs, c.treeBytesMemo))
+			c.reject("directory deleted", path.Join(rel, name))
 		}
 	}
 	return nil

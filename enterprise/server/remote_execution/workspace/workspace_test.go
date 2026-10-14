@@ -738,7 +738,7 @@ func TestDownloadInputs_VFSPrefetchMode(t *testing.T) {
 }
 
 func TestPool_ReusedWorkspaceMatchesFreshSetup(t *testing.T) {
-	flags.Set(t, "executor.workspace_reuse_pool_size", 4)
+	flags.Set(t, "executor.workspace_reuse.pool_size", 4)
 	te := testenv.GetTestEnv(t)
 	_, runServer, lis := testenv.RegisterLocalGRPCServer(t, te)
 	testcache.Setup(t, te, lis)
@@ -894,7 +894,7 @@ func TestPool_ReusedWorkspaceMatchesFreshSetup(t *testing.T) {
 		// next task then links again.
 		for _, maxFileSize := range []int64{0, 4} {
 			t.Run(fmt.Sprintf("%s/max_file_size=%d", test.name, maxFileSize), func(t *testing.T) {
-				flags.Set(t, "executor.workspace_reuse_max_file_size_bytes", maxFileSize)
+				flags.Set(t, "executor.workspace_reuse.max_file_size_bytes", maxFileSize)
 				buildRoot := testfs.MakeTempDir(t)
 				pool, err := workspace.NewPool(buildRoot)
 				require.NoError(t, err)

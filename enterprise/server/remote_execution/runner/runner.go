@@ -23,6 +23,7 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/block_io"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/commandutil"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/container"
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/execution_experiments"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/executor/oomkiller"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/executorplatform"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/filecache"
@@ -1328,6 +1329,7 @@ func (p *pool) newRunner(ctx context.Context, key *rnpb.RunnerKey, props *platfo
 		VFSPrefetchMode: vfsPrefetchMode,
 	}
 	// We only pool workspaces if all of these are true:
+	//  - The executor.workspace_reuse.enabled experiment is on for the task.
 	//  - It's a "normal," ephemeral action workspace (non-FUSE, non-overlayfs,
 	//    non-recycled, not preserved).
 	//  - It's a hardlinked workspace, not copy-on-write. Copy-on-write
@@ -1337,7 +1339,8 @@ func (p *pool) newRunner(ctx context.Context, key *rnpb.RunnerKey, props *platfo
 	//  - The task isn't anonymous, unless the executor isn't shared. This is
 	//    the same rule as for runner recycling, since on a shared executor,
 	//    unrelated users can send anonymous tasks under one group.
-	if p.workspacePool != nil && !props.RecycleRunner && !props.PreserveWorkspace && !useOverlayfs && !props.EnableVFS &&
+	if p.workspacePool != nil && execution_experiments.WorkspaceReuseEnabled.Get(ctx) &&
+		!props.RecycleRunner && !props.PreserveWorkspace && !useOverlayfs && !props.EnableVFS &&
 		!filecache.ClonesInputs(ctx) &&
 		(key.GetGroupId() != "" || container.AnonymousRecyclingEnabled()) {
 		wsOpts.Pool = p.workspacePool

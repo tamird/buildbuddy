@@ -28,12 +28,13 @@ func lstatDir(path string) (dirFingerprint, bool, error) {
 	}, true, nil
 }
 
-// waitForTimestampTick waits until the clock that the kernel uses for file
-// timestamps is past t. Without multigrain timestamps, the kernel stamps
-// changes with a coarse clock that only advances once per tick, so a change
-// made in the same tick as the last change before a fingerprint was recorded
-// would leave the directory's ctime as recorded. Waiting takes at most one
-// tick.
+// waitForTimestampTick waits until the kernel's coarse clock is past t so we
+// can detect directory changes made by the action after we record fingerprints.
+// Without multigrain timestamps, the kernel uses this clock for file timestamps
+// and advances it only once per tick. If the action changes a directory in the
+// same tick as setup's last change, the kernel assigns the same ctime we
+// recorded, so we miss the action's change. We pass the newest recorded ctime
+// as t and wait at most one tick before starting the action.
 func waitForTimestampTick(t int64) error {
 	for {
 		var now unix.Timespec
