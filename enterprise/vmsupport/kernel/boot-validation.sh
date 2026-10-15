@@ -1,6 +1,8 @@
 #!/bin/bash
 set -euo pipefail
-expected_source=${GITHUB_SHA:?}
+expected_source=${QUALIFICATION_COMMIT:?}
+credential_rc=${QUALIFICATION_CREDENTIAL_RC:?}
+[[ $credential_rc == /* && -r $credential_rc ]]
 before_source=42c327ab1bc738e3ac87de5ed4d579bfba11be56
 work_deadline=$(python3 -c 'import time; print(time.monotonic() + 30 * 60)')
 remaining_work_seconds() {
@@ -55,7 +57,7 @@ finish() {
 }
 trap finish EXIT
 cat > "$rc" <<'RC'
-# Use the public endpoint and the repository's existing Linux RBE configuration.
+# Use the repository's existing Linux RBE configuration with a private credential RC.
 # Keep the repository's canonical BLAKE3 startup digest.
 startup --host_jvm_args=-Xmx4g
 common --config=ci-anon
@@ -117,7 +119,7 @@ run_phase() {
   shift 2
   rm -f "$raw_events" || return 125
   printf '%s\n' "$command" "$@" > "$out/$phase-arguments.txt" || return 125
-  timeout --signal=INT --kill-after=30s "$(remaining_work_seconds)" "$provider_bazel" --bazelrc="$rc" \
+  timeout --signal=INT --kill-after=30s "$(remaining_work_seconds)" "$provider_bazel" --bazelrc="$rc" --bazelrc="$credential_rc" \
     "$command" --build_event_json_file="$raw_events" \
     --execution_log_compact_file="$out/$phase-execution.binpb" "$@" \
     > "$out/$phase-stdout.txt" 2> "$out/$phase-stderr.txt" || status=$?
