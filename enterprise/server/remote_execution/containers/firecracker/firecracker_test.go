@@ -464,6 +464,124 @@ func TestFirecrackerRunSimple(t *testing.T) {
 	assertCommandResult(t, expectedResult, res)
 }
 
+// TestFirecrackerKernelNetworking exercises the combined diagnostic kernel's
+// interfaces. It does not change either independently proposed kernel config PR.
+func TestFirecrackerKernelNetworking(t *testing.T) {
+	ctx := context.Background()
+	env := getTestEnv(ctx, t, envOpts{})
+	workDir := testfs.MakeDirAll(t, testfs.MakeTempDir(t), "work")
+	cmd := &repb.Command{
+		Arguments: []string{"python3", "-c", `
+import array
+import fcntl
+import json
+import platform
+import re
+import shutil
+import socket
+import subprocess
+
+
+def run(*args: str, body: str | None = None) -> str:
+    result = subprocess.run(args, input=body, text=True, capture_output=True, timeout=10)
+    if result.returncode:
+        raise RuntimeError(f"{args}: exit {result.returncode}; stdout={result.stdout!r}; stderr={result.stderr!r}")
+    return result.stdout
+
+
+# Linux include/uapi/linux/vhost.h, with the x86_64 _IOC encoding.
+VHOST_GET_FEATURES = 0x8008AF00
+VHOST_SET_OWNER = 0xAF01
+VHOST_RESET_OWNER = 0xAF02
+features = array.array("Q", [0])
+assert features.itemsize == 8
+with open("/dev/vhost-net", "rb+", buffering=0) as device:
+    fcntl.ioctl(device, VHOST_GET_FEATURES, features, True)
+    assert features[0] != 0, features
+    fcntl.ioctl(device, VHOST_SET_OWNER)
+    fcntl.ioctl(device, VHOST_RESET_OWNER)
+    fcntl.ioctl(device, VHOST_SET_OWNER)
+    fcntl.ioctl(device, VHOST_RESET_OWNER)
+print(json.dumps({"kernel": platform.release(), "vhost_features": hex(features[0]), "owner_reset_reacquire": True}), flush=True)
+
+for tool in ("nft", "iptables-legacy", "ip6tables-legacy", "iptables-legacy-save", "ip6tables-legacy-save"):
+    assert shutil.which(tool), f"Required tool absent from the pinned guest image: {tool}"
+print(json.dumps({"nft": run("nft", "--version").strip(), "iptables": run("iptables-legacy", "--version").strip()}), flush=True)
+
+run("nft", "-f", "-", body="""
+add table inet bb_kernel
+add chain inet bb_kernel input { type filter hook input priority 0; policy accept; }
+add rule inet bb_kernel input meta nfproto ipv4 udp dport 23001 fib saddr . iif oif exists counter accept comment "fib_ipv4"
+add rule inet bb_kernel input meta nfproto ipv6 udp dport 23002 fib saddr . iif oif exists counter accept comment "fib_ipv6"
+""")
+
+
+def packets(tool: str, table: str, port: int, fragment: str) -> int:
+    lines = [line for line in run(tool + "-save", "-c", "-t", table).splitlines()
+             if f"--dport {port} " in line and fragment in line]
+    [line] = lines
+    match = re.match(r"^\[(\d+):(\d+)\] ", line)
+    assert match, line
+    count = int(match.group(1))
+    assert count == 1, line
+    return count
+
+
+families = {}
+for name, family, address, port, tool in (
+    ("ipv4", socket.AF_INET, "127.0.0.1", 23001, "iptables-legacy"),
+    ("ipv6", socket.AF_INET6, "::1", 23002, "ip6tables-legacy"),
+):
+    common = ("-p", "udp", "--dport", str(port))
+    run(tool, "-w", "5", "-t", "raw", "-A", "OUTPUT", *common, "-j", "CT", "--notrack")
+    run(tool, "-w", "5", "-t", "mangle", "-A", "OUTPUT", *common, "-j", "MARK", "--set-mark", "0x1234")
+    run(tool, "-w", "5", "-t", "mangle", "-A", "OUTPUT", *common, "-m", "mark", "--mark", "0x1234", "-j", "ACCEPT")
+    run(tool, "-w", "5", "-t", "filter", "-A", "INPUT", *common, "-m", "conntrack", "--ctstate", "UNTRACKED", "-j", "ACCEPT")
+    payload = ("kernel-features-" + name).encode()
+    with socket.socket(family, socket.SOCK_DGRAM) as receiver, socket.socket(family, socket.SOCK_DGRAM) as sender:
+        receiver.settimeout(5)
+        receiver.bind((address, port))
+        assert sender.sendto(payload, (address, port)) == len(payload)
+        received, _ = receiver.recvfrom(1024)
+        assert received == payload, (received, payload)
+    families[name] = {
+        "payload": received.decode(),
+        "ct_packets": packets(tool, "raw", port, "-j CT --notrack"),
+        "mark_packets": packets(tool, "mangle", port, "-m mark "),
+        "untracked_packets": packets(tool, "filter", port, "--ctstate UNTRACKED"),
+    }
+
+rules = json.loads(run("nft", "-j", "list", "table", "inet", "bb_kernel"))["nftables"]
+for name, counters in families.items():
+    [rule] = [entry["rule"] for entry in rules if entry.get("rule", {}).get("comment") == "fib_" + name]
+    [counter] = [expr["counter"] for expr in rule["expr"] if "counter" in expr]
+    assert counter["packets"] == 1, (name, counter)
+    counters["fib_packets"] = counter["packets"]
+print(json.dumps({"families": families}, sort_keys=True), flush=True)
+`},
+	}
+	opts := firecracker.ContainerOpts{
+		ContainerImage:         imageWithDockerV28Installed,
+		ActionWorkingDirectory: workDir,
+		VMConfiguration: &fcpb.VMConfiguration{
+			NumCpus:           1,
+			MemSizeMb:         2500,
+			NetworkMode:       fcpb.NetworkMode_NETWORK_MODE_OFF,
+			Ipv6Enabled:       true,
+			ScratchDiskSizeMb: 100,
+		},
+		ExecutorConfig: getExecutorConfig(t),
+	}
+	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{}, opts)
+	require.NoError(t, err)
+	// Run owns the complete VM lifecycle, including cleanup after failure.
+	res := c.Run(ctx, cmd, opts.ActionWorkingDirectory, oci.Credentials{})
+	t.Logf("Guest kernel feature observations: %s", res.Stdout)
+	require.NoError(t, res.Error)
+	require.Equal(t, 0, res.ExitCode, "guest stderr: %s", res.Stderr)
+	require.Empty(t, res.Stderr)
+}
+
 func TestFirecrackerRunVFS(t *testing.T) {
 	ctx := context.Background()
 	env := getTestEnv(ctx, t, envOpts{})

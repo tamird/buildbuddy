@@ -3,7 +3,7 @@ set -euo pipefail
 expected_source=${QUALIFICATION_COMMIT:?}
 credential_rc=${QUALIFICATION_CREDENTIAL_RC:?}
 [[ $credential_rc == /* && -r $credential_rc ]]
-before_source=42c327ab1bc738e3ac87de5ed4d579bfba11be56
+before_source=4646fe7a15b0deda6e0059a3a475a05313c6e09c
 work_deadline=$(python3 -c 'import time; print(time.monotonic() + 30 * 60)')
 remaining_work_seconds() {
   python3 - "$work_deadline" <<'DEADLINE'
@@ -24,7 +24,7 @@ provider_bazel=$(type -P bazelisk)
 [[ $provider_bazel == /* && -x $provider_bazel ]]
 artifacts=${RUNNER_TEMP:?}/qualification
 mkdir -p "$artifacts"
-out=$(mktemp -d "$artifacts/buildbuddy-kernel-boot.XXXXXX")
+out=$(mktemp -d "$artifacts/buildbuddy-kernel-features.XXXXXX")
 raw_directory=$(mktemp -d)
 raw_events=$raw_directory/events.jsonl
 rc=$artifacts/qualification.bazelrc
@@ -97,7 +97,7 @@ python3 - "$out/changed-paths.txt" <<'PATHS'
 from pathlib import Path
 import sys
 actual = set(Path(sys.argv[1]).read_text().splitlines())
-expected = {'.github/workflows/coverage.yaml', 'enterprise/vmsupport/bin/BUILD', 'enterprise/vmsupport/kernel/boot-validation.sh'}
+expected = {'enterprise/vmsupport/kernel/microvm-kernel-x86_64-v5.15.config', 'enterprise/vmsupport/kernel/microvm-kernel-x86_64-v6.1.config', 'enterprise/server/remote_execution/containers/firecracker/firecracker_test.go', 'enterprise/vmsupport/kernel/boot-validation.sh'}
 assert actual == expected, (actual, expected)
 PATHS
 for file in .bazelrc .bazelversion shared.bazelrc MODULE.bazel MODULE.bazel.lock enterprise/vmsupport/kernel/BUILD enterprise/vmsupport/kernel/defs.bzl enterprise/vmsupport/kernel/rebuild.sh enterprise/vmsupport/kernel/microvm-kernel-x86_64-v5.15.config enterprise/vmsupport/kernel/microvm-kernel-x86_64-v6.1.config enterprise/vmsupport/bin/BUILD enterprise/vmsupport/bundle.go enterprise/vmsupport/BUILD enterprise/server/remote_execution/containers/firecracker/BUILD enterprise/server/remote_execution/containers/firecracker/firecracker_test.go enterprise/server/remote_execution/containers/firecracker/firecracker.go enterprise/server/cmd/goinit/main.go server/testutil/testnetworking/testnetworking.go .github/workflows/coverage.yaml enterprise/vmsupport/kernel/boot-validation.sh; do
@@ -259,7 +259,7 @@ for version in v5.15 v6.1; do
   enabled=false
   if [[ $version == v6.1 ]]; then enabled=true; fi
   run_phase "$version" test \
-    --test_filter='^TestFirecrackerRunSimple$' \
+    --test_filter='^TestFirecrackerKernelNetworking$' \
     "--test_arg=--executor.firecracker_enable_linux_6_1=$enabled" \
     //enterprise/server/remote_execution/containers/firecracker:firecracker_test || result=$?
   if (( result == 0 )); then
@@ -271,7 +271,7 @@ import xml.etree.ElementTree as ET
 out, version = Path(sys.argv[1]), sys.argv[2]
 path = out / version / 'enterprise/server/remote_execution/containers/firecracker/firecracker_test/test.xml'
 cases = ET.parse(path).getroot().findall('.//testcase')
-assert len(cases) == 1 and cases[0].get('name') == 'TestFirecrackerRunSimple', [case.attrib for case in cases]
+assert len(cases) == 1 and cases[0].get('name') == 'TestFirecrackerKernelNetworking', [case.attrib for case in cases]
 assert all(cases[0].find(tag) is None for tag in ('failure', 'error', 'skipped'))
 (out / (version + '-census.json')).write_text(json.dumps({'case': cases[0].get('name'), 'passed': True}) + '\n')
 CHECK
