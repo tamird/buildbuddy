@@ -192,6 +192,7 @@ EVENTS
 
 result=0
 run_phase kernels build \
+  --build_tag_filters= \
   //enterprise/vmsupport/kernel:guest_kernel_x86_64_v5_15 \
   //enterprise/vmsupport/kernel:guest_kernel_x86_64_v6_1 \
   //enterprise/server/cmd/executor:firecracker \
@@ -208,10 +209,17 @@ from urllib.parse import unquote, urlsplit
 out = Path(sys.argv[1])
 expected = {'vmlinux-x86_64-v5.15', 'vmlinux-x86_64-v6.1'}
 found = {}
+requested = {arg for arg in (out / 'kernels-arguments.txt').read_text().splitlines() if arg.startswith('//')}
+assert len(requested) == 5, requested
+completed = set()
 for line in (out / 'kernels-events.jsonl').read_text().splitlines():
     if not line.strip():
         continue
     event = json.loads(line)
+    target = event.get('id', {}).get('targetCompleted')
+    if target is not None and not target.get('aspect'):
+        assert event['completed']['success'], event
+        completed.add(target['label'])
     for item in event.get('namedSetOfFiles', {}).get('files', []):
         name = Path(item['name']).name
         if name not in expected:
@@ -236,6 +244,7 @@ for line in (out / 'kernels-events.jsonl').read_text().splitlines():
         else:
             shutil.copyfile(local, out / name)
             found[name] = record
+assert completed == requested, (completed, requested)
 assert set(found) == expected, found
 (out / 'kernel-artifacts.json').write_text(json.dumps(found, indent=2) + '\n')
 KERNELS
