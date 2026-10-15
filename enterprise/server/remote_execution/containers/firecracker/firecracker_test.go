@@ -477,9 +477,9 @@ import fcntl
 import json
 import platform
 import re
-import shutil
 import socket
 import subprocess
+import traceback
 
 
 def run(*args: str, body: str | None = None) -> str:
@@ -489,31 +489,32 @@ def run(*args: str, body: str | None = None) -> str:
     return result.stdout
 
 
-# Linux include/uapi/linux/vhost.h, with the x86_64 _IOC encoding.
-VHOST_GET_FEATURES = 0x8008AF00
-VHOST_SET_OWNER = 0xAF01
-VHOST_RESET_OWNER = 0xAF02
-features = array.array("Q", [0])
-assert features.itemsize == 8
-with open("/dev/vhost-net", "rb+", buffering=0) as device:
-    fcntl.ioctl(device, VHOST_GET_FEATURES, features, True)
-    assert features[0] != 0, features
-    fcntl.ioctl(device, VHOST_SET_OWNER)
-    fcntl.ioctl(device, VHOST_RESET_OWNER)
-    fcntl.ioctl(device, VHOST_SET_OWNER)
-    fcntl.ioctl(device, VHOST_RESET_OWNER)
-print(json.dumps({"kernel": platform.release(), "vhost_features": hex(features[0]), "owner_reset_reacquire": True}), flush=True)
+def vhost() -> dict[str, str | bool]:
+    # Linux include/uapi/linux/vhost.h, with the x86_64 _IOC encoding.
+    VHOST_GET_FEATURES = 0x8008AF00
+    VHOST_SET_OWNER = 0xAF01
+    VHOST_RESET_OWNER = 0xAF02
+    features = array.array("Q", [0])
+    assert features.itemsize == 8, features.itemsize
+    with open("/dev/vhost-net", "rb+", buffering=0) as device:
+        fcntl.ioctl(device, VHOST_GET_FEATURES, features, True)
+        assert features[0] != 0, features
+        fcntl.ioctl(device, VHOST_SET_OWNER)
+        fcntl.ioctl(device, VHOST_RESET_OWNER)
+        fcntl.ioctl(device, VHOST_SET_OWNER)
+        fcntl.ioctl(device, VHOST_RESET_OWNER)
+    return {"vhost_features": hex(features[0]), "owner_reset_reacquire": True}
 
-for tool in ("nft", "iptables-legacy", "ip6tables-legacy", "iptables-legacy-save", "ip6tables-legacy-save"):
-    assert shutil.which(tool), f"Required tool absent from the pinned guest image: {tool}"
-print(json.dumps({"nft": run("nft", "--version").strip(), "iptables": run("iptables-legacy", "--version").strip()}), flush=True)
 
-run("nft", "-f", "-", body="""
-add table inet bb_kernel
-add chain inet bb_kernel input { type filter hook input priority 0; policy accept; }
-add rule inet bb_kernel input meta nfproto ipv4 udp dport 23001 fib saddr . iif oif exists counter accept comment "fib_ipv4"
-add rule inet bb_kernel input meta nfproto ipv6 udp dport 23002 fib saddr . iif oif exists counter accept comment "fib_ipv6"
-""")
+def udp(family: int, address: str, port: int) -> str:
+    payload = f"kernel-features-{port}".encode()
+    with socket.socket(family, socket.SOCK_DGRAM) as receiver, socket.socket(family, socket.SOCK_DGRAM) as sender:
+        receiver.settimeout(5)
+        receiver.bind((address, port))
+        assert sender.sendto(payload, (address, port)) == len(payload), payload
+        received, _ = receiver.recvfrom(1024)
+        assert received == payload, (received, payload)
+    return received.decode()
 
 
 def packets(tool: str, table: str, port: int, fragment: str) -> int:
@@ -527,37 +528,67 @@ def packets(tool: str, table: str, port: int, fragment: str) -> int:
     return count
 
 
-families = {}
-for name, family, address, port, tool in (
-    ("ipv4", socket.AF_INET, "127.0.0.1", 23001, "iptables-legacy"),
-    ("ipv6", socket.AF_INET6, "::1", 23002, "ip6tables-legacy"),
-):
+def legacy(feature: str, tool: str, family: int, address: str, port: int) -> dict[str, str | int]:
+    version = run(tool, "--version").strip()
     common = ("-p", "udp", "--dport", str(port))
-    run(tool, "-w", "5", "-t", "raw", "-A", "OUTPUT", *common, "-j", "CT", "--notrack")
+    if feature == "ct":
+        run(tool, "-w", "5", "-t", "raw", "-A", "OUTPUT", *common, "-j", "CT", "--notrack")
+        run(tool, "-w", "5", "-t", "filter", "-A", "INPUT", *common, "-m", "conntrack", "--ctstate", "UNTRACKED", "-j", "ACCEPT")
+        payload = udp(family, address, port)
+        return {"tool": version, "payload": payload,
+                "ct_packets": packets(tool, "raw", port, "-j CT --notrack"),
+                "untracked_packets": packets(tool, "filter", port, "--ctstate UNTRACKED")}
+    assert feature == "mark", feature
     run(tool, "-w", "5", "-t", "mangle", "-A", "OUTPUT", *common, "-j", "MARK", "--set-mark", "0x1234")
     run(tool, "-w", "5", "-t", "mangle", "-A", "OUTPUT", *common, "-m", "mark", "--mark", "0x1234", "-j", "ACCEPT")
-    run(tool, "-w", "5", "-t", "filter", "-A", "INPUT", *common, "-m", "conntrack", "--ctstate", "UNTRACKED", "-j", "ACCEPT")
-    payload = ("kernel-features-" + name).encode()
-    with socket.socket(family, socket.SOCK_DGRAM) as receiver, socket.socket(family, socket.SOCK_DGRAM) as sender:
-        receiver.settimeout(5)
-        receiver.bind((address, port))
-        assert sender.sendto(payload, (address, port)) == len(payload)
-        received, _ = receiver.recvfrom(1024)
-        assert received == payload, (received, payload)
-    families[name] = {
-        "payload": received.decode(),
-        "ct_packets": packets(tool, "raw", port, "-j CT --notrack"),
-        "mark_packets": packets(tool, "mangle", port, "-m mark "),
-        "untracked_packets": packets(tool, "filter", port, "--ctstate UNTRACKED"),
-    }
+    payload = udp(family, address, port)
+    return {"tool": version, "payload": payload, "mark_packets": packets(tool, "mangle", port, "-m mark ")}
 
-rules = json.loads(run("nft", "-j", "list", "table", "inet", "bb_kernel"))["nftables"]
-for name, counters in families.items():
+
+def fib(name: str, family: int, address: str, port: int) -> dict[str, str | int]:
+    version = run("nft", "--version").strip()
+    table = "bb_" + name
+    # Use prerouting because Linux 5.15 restricts this lookup to that hook.
+    run("nft", "-f", "-", body=f"""
+add table inet {table}
+add chain inet {table} prerouting {{ type filter hook prerouting priority 0; policy accept; }}
+add rule inet {table} prerouting meta nfproto {name} udp dport {port} fib saddr . iif oif exists counter accept comment "fib_{name}"
+""")
+    payload = udp(family, address, port)
+    rules = json.loads(run("nft", "-j", "list", "table", "inet", table))["nftables"]
     [rule] = [entry["rule"] for entry in rules if entry.get("rule", {}).get("comment") == "fib_" + name]
     [counter] = [expr["counter"] for expr in rule["expr"] if "counter" in expr]
     assert counter["packets"] == 1, (name, counter)
-    counters["fib_packets"] = counter["packets"]
-print(json.dumps({"families": families}, sort_keys=True), flush=True)
+    return {"tool": version, "payload": payload, "fib_packets": counter["packets"]}
+
+
+failures = []
+print(json.dumps({"kernel": platform.release()}), flush=True)
+try:
+    print(json.dumps({"feature": "vhost", "passed": True, **vhost()}), flush=True)
+except (OSError, AssertionError, ValueError) as error:
+    failures.append("vhost")
+    traceback.print_exc()
+    print(json.dumps({"feature": "vhost", "passed": False, "error": repr(error)}), flush=True)
+for name, family, address, base_port, tool in (
+    ("ipv4", socket.AF_INET, "127.0.0.1", 23000, "iptables-legacy"),
+    ("ipv6", socket.AF_INET6, "::1", 23010, "ip6tables-legacy"),
+):
+    # Distinct ports keep partially installed rules from affecting another check.
+    for offset, feature in enumerate(("ct", "mark", "fib"), 1):
+        identity = name + "_" + feature
+        try:
+            if feature == "fib":
+                observation = fib(name, family, address, base_port + offset)
+            else:
+                observation = legacy(feature, tool, family, address, base_port + offset)
+            print(json.dumps({"feature": identity, "passed": True, **observation}), flush=True)
+        except (OSError, RuntimeError, AssertionError, ValueError, KeyError, subprocess.TimeoutExpired) as error:
+            failures.append(identity)
+            traceback.print_exc()
+            print(json.dumps({"feature": identity, "passed": False, "error": repr(error)}), flush=True)
+print(json.dumps({"failed_features": failures}), flush=True)
+raise SystemExit(bool(failures))
 `},
 	}
 	opts := firecracker.ContainerOpts{
@@ -574,7 +605,7 @@ print(json.dumps({"families": families}, sort_keys=True), flush=True)
 	}
 	c, err := firecracker.NewContainer(ctx, env, &repb.ExecutionTask{}, opts)
 	require.NoError(t, err)
-	// Run owns the complete VM lifecycle, including cleanup after failure.
+	// Run removes the VM after command execution, including a guest command failure.
 	res := c.Run(ctx, cmd, opts.ActionWorkingDirectory, oci.Credentials{})
 	t.Logf("Guest kernel feature observations: %s", res.Stdout)
 	require.NoError(t, res.Error)
