@@ -1,12 +1,15 @@
 name: Coverage
 
 on:
+  push:
+    branches: [diagnostics/guest-kernel-boot]
   workflow_dispatch: # Manually
   schedule:
     - cron: "0 0 * * *" # Daily
 
 jobs:
   build:
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -35,3 +38,33 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.BUILDBUDDY_GITHUB_USER_TOKEN }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_CI_WEBHOOK_URL }}
         if: always()
+
+  guest-kernel-boot:
+    if: github.repository == 'tamird/buildbuddy' && github.event_name == 'push' && github.ref == 'refs/heads/diagnostics/guest-kernel-boot'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout exact diagnostic source
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Prepare existing local Firecracker requirements
+        run: |
+          sudo -n apt-get update
+          sudo -n apt-get install -y iproute2 iptables e2fsprogs fuse3 zstd
+          sudo -n modprobe fuse
+          test -c /dev/kvm
+          test -c /dev/fuse
+          command -v bazelisk
+      - name: Build remotely and boot both kernels locally
+        run: sudo --preserve-env=PATH,RUNNER_TEMP,GITHUB_SHA bash enterprise/vmsupport/kernel/boot-validation.sh
+      - name: Retain original validation evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: guest-kernel-boot
+          path: ${{ runner.temp }}/qualification/evidence.tar.gz
+          if-no-files-found: error
