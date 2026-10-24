@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tarfile
 import time
 import re
 import xml.etree.ElementTree as ET
@@ -21,6 +22,7 @@ from image_execution import execution_records
 SOURCE = os.environ["NETEM_QUALIFICATION_SOURCE"]
 KERNELS = ["//enterprise/vmsupport/kernel:guest_kernel_" + name for name in
            ("x86_64_v5_15", "x86_64_v6_18", "aarch64_v5_10")]
+TCG_SMOKE = "//enterprise/vmsupport/kernel/netem_smoke:netem_smoke_test"
 SMOKE = "//enterprise/server/remote_execution/containers/firecracker:firecracker_test"
 REPORTER_SOURCE = "462126434f0cdf5e56f37603c82b563b456f1ce8"
 REPORTER_HASHES = {
@@ -32,10 +34,11 @@ REPORTER_HASHES = {
 def main() -> int:
     if sys.version_info < (3, 11):
         raise RuntimeError("Qualification requires Python 3.11+")
-    if sys.argv[1:] not in ([], ["--prepare-lock"]):
-        raise ValueError("Expected no arguments or --prepare-lock")
+    if sys.argv[1:] not in ([], ["--prepare-lock"], ["--tcg-smoke"]):
+        raise ValueError("Expected no arguments, --prepare-lock, or --tcg-smoke")
     prepare_lock = sys.argv[1:] == ["--prepare-lock"]
-    work_seconds = 900 if prepare_lock else 2400
+    tcg_smoke = sys.argv[1:] == ["--tcg-smoke"]
+    work_seconds = 900 if prepare_lock or tcg_smoke else 2400
     workspace = Path.cwd()
     if subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() != SOURCE:
         raise RuntimeError("Unexpected source")
@@ -97,9 +100,10 @@ def main() -> int:
         evidence = private / "evidence"
         evidence.mkdir()
         report.write_json(evidence / "plan.json", {"source": SOURCE, "kernels": KERNELS, "smoke": SMOKE,
-                          "work_seconds": work_seconds, "prepare_lock": prepare_lock, "native_bazel": bazel, "reporter": REPORTER_HASHES,
+                          "work_seconds": work_seconds, "prepare_lock": prepare_lock, "tcg_smoke": tcg_smoke, "native_bazel": bazel, "reporter": REPORTER_HASHES,
                           "scope": "Canonical dependency lock preparation only; no builds or tests." if prepare_lock else
-                                   "Three canonical builds; one uncached AMD64 changed-kernel bare-pool smoke. No uploads or deployment."})
+                                   ("One exact retained-kernel QEMU TCG smoke; no kernel rebuild or Firecracker credit." if tcg_smoke else
+                                    "Three canonical builds; one uncached AMD64 changed-kernel bare-pool smoke. No uploads or deployment.")})
         output_root = None
 
         def clean(data: bytes) -> bytes:
@@ -174,10 +178,66 @@ def main() -> int:
                 raise RuntimeError("Qualification phase did not pass: " + directory.name)
             return verdict
 
+        retained_kernel = workspace / "enterprise/vmsupport/kernel/netem_smoke/retained-vmlinux"
+        staged_kernel = False
+
+        def fetch_retained(item: dict, path: Path) -> None:
+            # Reuse the existing retained-runtime GetFile boundary. The private
+            # helper owns the credential, which is never restored to the env.
+            key, = json.loads((auth / "helper.json").read_text())["headers"]["x-buildbuddy-api-key"]
+            request = urllib.request.Request("https://app.buildbuddy.io/api/v1/GetFile",
+                data=json.dumps({"uri": item["uri"]}).encode(),
+                headers={"Content-Type": "application/json", "x-buildbuddy-api-key": key})
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("Retained kernel retrieval exhausted the work deadline")
+            with urllib.request.urlopen(request, timeout=min(180, remaining)) as response:
+                data = response.read(item["bytes"] + 1)
+            if len(data) != item["bytes"] or hashlib.sha256(data).hexdigest() != item["sha256"]:
+                raise ValueError("Retained kernel supplier identity differs")
+            path.write_bytes(data)
+
         completed = False
         try:
             if prepare_lock:
                 invoke("dependencies", ["mod", "deps", "--lockfile_mode=update"], "command", [], retain_updated_lock=True)
+            elif tcg_smoke:
+                if retained_kernel.exists() or retained_kernel.is_symlink():
+                    raise ValueError("Retained kernel destination already exists")
+                supplier = {"uri": "bytestream://remote.buildbuddy.io/bb-snapshot/blobs/8a7ac41432c0c46dcfa095e2076f4d9350d838702fd8cf20588094e41f7e3f8d/551950",
+                            "bytes": 551950, "sha256": "8a7ac41432c0c46dcfa095e2076f4d9350d838702fd8cf20588094e41f7e3f8d"}
+                supplier_path = private / "kernel-supplier.tar.gz"
+                fetch_retained(supplier, supplier_path)
+                with tarfile.open(supplier_path) as archive:
+                    verdict = json.load(archive.extractfile("invocation-kernels/verdict.json"))
+                    if verdict["source"] != "8c4bcd313e750e1e29828c79e831923ad7f15ca1" or verdict["status"] != "PASS" or verdict["native_exit"] != 0:
+                        raise ValueError("Retained kernel supplier build did not pass")
+                    events = evidence / "kernel-supplier-events.jsonl"
+                    events.write_bytes(archive.extractfile("invocation-kernels/events.jsonl").read())
+                    report.write_json(evidence / "kernel-supplier-verdict.json", verdict)
+                groups = {(report.Owner(row["label"], row["configuration"]), "default") for row in verdict["expected"]}
+                outputs = report.advertised_build_outputs(events, groups)
+                kernel, = [row for row in outputs if row["identity"]["label"] == KERNELS[1]]
+                if kernel["sha256"] != "15e5a8edd2f5786019408d38d68084c5bd92cf6f7c44a186c2adaf1e1bf3e532" or kernel["bytes"] != 33762240:
+                    raise ValueError("Unexpected retained 6.18 kernel")
+                blob = {**kernel, "uri": f"bytestream://remote.buildbuddy.io/blobs/{kernel['sha256']}/{kernel['bytes']}"}
+                fetch_retained(blob, retained_kernel)
+                staged_kernel = True
+                report.write_json(evidence / "kernel-supplier.json", {"bundle": supplier, "output": kernel, "materialized": report.file_record(retained_kernel)})
+                invoke("execution-root", ["info", "output_base"], "command", [])
+                output_root = Path((evidence / "invocation-execution-root/stdout.log").read_text().strip())
+                if not output_root.is_absolute() or not output_root.is_dir():
+                    raise ValueError("Invalid native output base")
+                invoke("buildifier", ["run", "//:buildifier", "--", "-mode=check", "enterprise/vmsupport/kernel/netem_smoke/BUILD", "deps/apt.MODULE.bazel"], "command", [])
+                invoke("tcg-smoke", ["test", "--test_sharding_strategy=disabled", "--nocache_test_results", "--runs_per_test=1", "--flaky_test_attempts=1", "--test_timeout=300", TCG_SMOKE], "test", [TCG_SMOKE])
+                manifest = report.read_json(report.manifest_path(evidence / "invocation-tcg-smoke/events.jsonl"))
+                logs = [row for row in manifest["reports"] if row["name"] == "test.log"]
+                if len(logs) != 1:
+                    raise ValueError("Expected one TCG smoke log")
+                log = (evidence / "invocation-tcg-smoke" / logs[0]["path"]).read_text()
+                if any(marker not in log for marker in ("test_changed_kernel_netem", "Ran 1 test", "NETEM_EXIT=0", "NETEM_ADDED", "NETEM_CHANGED", "NETEM_CLEANED", "NETEM_KERNEL sha256=" + kernel["sha256"] + " bytes=" + str(kernel["bytes"]))):
+                    raise ValueError("TCG smoke omitted a required native marker")
+                report.write_json(evidence / "tcg-smoke.json", {"status": "PASS", "kernel": kernel, "log": logs[0], "scope": "QEMU TCG boot and actual qdisc control; no Firecracker or packet-rate measurement."})
             else:
                 invoke("execution-root", ["info", "output_base"], "command", [])
                 output_root = Path((evidence / "invocation-execution-root/stdout.log").read_text().strip())
@@ -237,6 +297,8 @@ def main() -> int:
             runner_exit = runner_exit or 1
             report.write_json(evidence / "qualification-error.json", {"type": type(error).__name__, "message": clean(str(error).encode()).decode()})
         finally:
+            if staged_kernel:
+                retained_kernel.unlink()
             if not completed:
                 runner_exit = runner_exit or 1
             # Scan uncompressed evidence before it enters the sole artifact.

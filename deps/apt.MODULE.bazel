@@ -71,3 +71,22 @@ apt.install(
     ],
 )
 use_repo(apt, "debian13")
+
+# Qualification-only tools for booting the changed kernel without nested KVM.
+apt.install(
+    dependency_set = "netem_smoke_tools",
+    include_transitive = True,
+    mergedusr = True,
+    packages = [
+        "busybox-static:amd64",
+        "cpio:amd64",
+        "iproute2:amd64",
+        "qemu-system-x86:amd64",
+    ],
+    suites = [
+        "trixie",
+        "trixie-updates",
+        "trixie-security",
+    ],
+)
+use_repo(apt, "netem_smoke_tools")
