@@ -42,6 +42,11 @@ class NetemSmokeTest(unittest.TestCase):
             libraries = str(tools / "usr/lib/x86_64-linux-gnu")
             def command(path: str) -> list[str]:
                 return [str(loader), "--library-path", libraries, str(tools / path)]
+            for name, path in (("qemu", "usr/bin/qemu-system-x86_64"), ("cpio", "usr/bin/cpio")):
+                listed = subprocess.check_output(command(path)[:3] + ["--list", command(path)[3]], text=True, timeout=10)
+                (output / (name + "-libraries.txt")).write_text(listed)
+                for library in re.findall(r"(?:=>\s+)?(/[^\s]+)\s+\(", listed):
+                    self.assertTrue(Path(library).resolve().is_relative_to(tools), library)
             guest = root / "guest"
             (guest / "usr/bin").mkdir(parents=True)
             (guest / "usr/sbin").mkdir()
@@ -61,7 +66,8 @@ class NetemSmokeTest(unittest.TestCase):
                 subprocess.run(command("usr/bin/cpio") + ["--null", "-o", "-H", "newc", "--quiet", "--owner=0:0"],
                                cwd=guest, input="\0".join(members).encode() + b"\0", stdout=stream, check=True, timeout=30)
             qemu = command("usr/bin/qemu-system-x86_64")
-            version = subprocess.check_output(qemu + ["--version"], text=True, timeout=10)
+            environment = {**os.environ, "QEMU_MODULE_DIR": str(tools / "usr/lib/x86_64-linux-gnu/qemu")}
+            version = subprocess.check_output(qemu + ["--version"], text=True, timeout=10, env=environment)
             argv = qemu + ["-machine", "pc", "-accel", "tcg,thread=single", "-cpu", "max", "-smp", "1", "-m", "512",
                            "-L", str(tools / "usr/share/qemu"), "-bios", str(tools / "usr/share/seabios/bios-256k.bin"),
                            "-nodefaults", "-no-user-config", "-display", "none", "-monitor", "none", "-serial", "stdio", "-no-reboot",
@@ -74,7 +80,7 @@ class NetemSmokeTest(unittest.TestCase):
                 "emulator": "QEMU TCG", "initrd_sha256": hashlib.sha256(initrd.read_bytes()).hexdigest(),
             }, indent=2) + "\n")
             with (output / "guest.log").open("wb") as log:
-                completed = subprocess.run(argv, stdout=log, stderr=subprocess.STDOUT, timeout=180)
+                completed = subprocess.run(argv, stdout=log, stderr=subprocess.STDOUT, timeout=180, env=environment)
             log = (output / "guest.log").read_text(errors="replace")
             print(version, log, sep="\n")
             self.assertEqual(completed.returncode, 0)

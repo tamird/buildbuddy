@@ -229,6 +229,19 @@ def main() -> int:
                 if not output_root.is_absolute() or not output_root.is_dir():
                     raise ValueError("Invalid native output base")
                 invoke("buildifier", ["run", "//:buildifier", "--", "-mode=check", "enterprise/vmsupport/kernel/netem_smoke/BUILD", "deps/apt.MODULE.bazel"], "command", [])
+                tools_build = invoke("tcg-tools", ["build", "//enterprise/vmsupport/kernel/netem_smoke:tools"], "build", ["//enterprise/vmsupport/kernel/netem_smoke:tools"])
+                groups = {(report.Owner(row["label"], row["configuration"]), "default") for row in tools_build["expected"]}
+                tools_output, = report.advertised_build_outputs(evidence / "invocation-tcg-tools/events.jsonl", groups)
+                tools_path = Path(unquote(urlsplit(tools_output["uri"]).path))
+                if not tools_output["uri"].startswith("file:///") or report.file_record(tools_path) != {key: tools_output[key] for key in ("sha256", "bytes")}:
+                    raise ValueError("Declared TCG tools archive differs from native output")
+                with tarfile.open(tools_path) as archive:
+                    members = [{"name": member.name, "type": member.type.decode(), "link": member.linkname, "bytes": member.size} for member in archive]
+                names = {row["name"].removeprefix("./") for row in members}
+                required = {"usr/bin/qemu-system-x86_64", "usr/bin/cpio", "usr/bin/busybox", "usr/sbin/ip", "usr/sbin/tc", "usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2", "usr/share/seabios/bios-256k.bin", "usr/share/qemu/pvh.bin"}
+                if not required.issubset(names):
+                    raise ValueError("Declared QEMU tools lack required paths: " + str(sorted(required - names)))
+                report.write_json(evidence / "tcg-tools.json", {"output": tools_output, "members": members})
                 invoke("tcg-smoke", ["test", "--test_sharding_strategy=disabled", "--nocache_test_results", "--runs_per_test=1", "--flaky_test_attempts=1", "--test_timeout=300", TCG_SMOKE], "test", [TCG_SMOKE])
                 manifest = report.read_json(report.manifest_path(evidence / "invocation-tcg-smoke/events.jsonl"))
                 logs = [row for row in manifest["reports"] if row["name"] == "test.log"]
