@@ -98,7 +98,8 @@ def main() -> int:
         evidence.mkdir()
         report.write_json(evidence / "plan.json", {"source": SOURCE, "kernels": KERNELS, "smoke": SMOKE,
                           "work_seconds": work_seconds, "prepare_lock": prepare_lock, "native_bazel": bazel, "reporter": REPORTER_HASHES,
-                          "scope": "Three canonical builds; one uncached AMD64 changed-kernel bare-pool smoke. No uploads or deployment."})
+                          "scope": "Canonical dependency lock preparation only; no builds or tests." if prepare_lock else
+                                   "Three canonical builds; one uncached AMD64 changed-kernel bare-pool smoke. No uploads or deployment."})
         output_root = None
 
         def clean(data: bytes) -> bytes:
