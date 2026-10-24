@@ -32,6 +32,10 @@ REPORTER_HASHES = {
 def main() -> int:
     if sys.version_info < (3, 11):
         raise RuntimeError("Qualification requires Python 3.11+")
+    if sys.argv[1:] not in ([], ["--prepare-lock"]):
+        raise ValueError("Expected no arguments or --prepare-lock")
+    prepare_lock = sys.argv[1:] == ["--prepare-lock"]
+    work_seconds = 900 if prepare_lock else 2400
     workspace = Path.cwd()
     if subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip() != SOURCE:
         raise RuntimeError("Unexpected source")
@@ -41,7 +45,7 @@ def main() -> int:
         raise RuntimeError("Unexpected per-user workspace RC")
     artifacts = Path(os.environ["BUILDBUDDY_ARTIFACTS_DIRECTORY"])
     artifacts.mkdir(parents=True, exist_ok=True)
-    deadline = time.monotonic() + 2400
+    deadline = time.monotonic() + work_seconds
     runner_exit = capture_exit = 0
     with tempfile.TemporaryDirectory(prefix="netem-qualification-") as temporary:
         private = Path(temporary)
@@ -93,7 +97,7 @@ def main() -> int:
         evidence = private / "evidence"
         evidence.mkdir()
         report.write_json(evidence / "plan.json", {"source": SOURCE, "kernels": KERNELS, "smoke": SMOKE,
-                          "work_seconds": 2400, "native_bazel": bazel, "reporter": REPORTER_HASHES,
+                          "work_seconds": work_seconds, "prepare_lock": prepare_lock, "native_bazel": bazel, "reporter": REPORTER_HASHES,
                           "scope": "Three canonical builds; one uncached AMD64 changed-kernel bare-pool smoke. No uploads or deployment."})
         output_root = None
 
@@ -102,13 +106,14 @@ def main() -> int:
                 data = data.replace(value, b"[REDACTED]")
             return data
 
-        def invoke(name: str, args: list[str], kind: str, targets: list[str]) -> dict:
+        def invoke(name: str, args: list[str], kind: str, targets: list[str], *, retain_updated_lock: bool = False) -> dict:
             nonlocal runner_exit, capture_exit, output_root
             directory = evidence / ("invocation-" + name)
             directory.mkdir()
             events = directory / "events.jsonl"
             raw_events = private / (name + ".events.jsonl")
-            command = [bazel, *startup, args[0], *options, *args[1:]]
+            command_options = [] if retain_updated_lock else options
+            command = [bazel, *startup, args[0], *command_options, *args[1:]]
             if kind != "command":
                 command += ["--build_event_json_file=" + str(raw_events)]
             report.write_json(directory / "command.json", command)
@@ -126,6 +131,13 @@ def main() -> int:
                 with (directory / "stdout.log").open("wb") as stdout, (directory / "stderr.log").open("wb") as stderr:
                     native = subprocess.run(["timeout", "--signal=TERM", "--kill-after=5s", str(remaining), *command], stdout=stdout, stderr=stderr).returncode
             finally:
+                if retain_updated_lock:
+                    # Retain the generated dependency result, then restore the
+                    # exact original before the normal source-integrity check.
+                    try:
+                        (evidence / "MODULE.bazel.lock").write_bytes((workspace / "MODULE.bazel.lock").read_bytes())
+                    finally:
+                        (workspace / "MODULE.bazel.lock").write_bytes((directory / "lock-before").read_bytes())
                 finished = datetime.datetime.now(datetime.timezone.utc).isoformat()
                 if native is not None:
                     (directory / "native-exit").write_text(str(native) + "\n")
@@ -163,59 +175,62 @@ def main() -> int:
 
         completed = False
         try:
-            invoke("execution-root", ["info", "output_base"], "command", [])
-            output_root = Path((evidence / "invocation-execution-root/stdout.log").read_text().strip())
-            if not output_root.is_absolute() or not output_root.is_dir():
-                raise ValueError("Invalid native output base")
-            invoke("buildifier", ["run", "//:buildifier", "--", "-mode=check", "enterprise/server/remote_execution/containers/firecracker/BUILD"], "command", [])
-            invoke("gofmt", ["run", "//:gofmt", "--", "-d", "enterprise/server/remote_execution/containers/firecracker/netem_qualification_test.go"], "command", [])
-            if (evidence / "invocation-gofmt/stdout.log").read_bytes():
-                raise ValueError("gofmt emitted a diff")
-            action_log = private / "kernel-actions.json"
-            built = invoke("kernels", ["build", "--noremote_accept_cached", "--execution_log_json_file=" + str(action_log), *KERNELS], "build", KERNELS)
-            groups = {(report.Owner(row["label"], row["configuration"]), "default") for row in built["expected"]}
-            outputs = report.advertised_build_outputs(evidence / "invocation-kernels/events.jsonl", groups)
-            if len(outputs) != 3:
-                raise ValueError("Expected three canonical kernel outputs")
-            actions = []
-            with action_log.open() as stream:
-                for _, action in execution_records(stream):
-                    if action is not None and action["targetLabel"] in [label + "_build" for label in KERNELS]:
-                        actions.append(action)
-            if {action["targetLabel"] for action in actions} != {label + "_build" for label in KERNELS} or len(actions) != 3:
-                raise ValueError("Missing or duplicate kernel build actions")
-            for output in outputs:
-                uri = urlsplit(output["uri"])
-                if uri.scheme != "file" or uri.netloc not in ("", "localhost"):
-                    raise ValueError("Expected downloaded kernel output")
-                if report.file_record(Path(unquote(uri.path))) != {key: output[key] for key in ("sha256", "bytes")}:
-                    raise ValueError("Kernel output does not match native BEP")
-                action, = [action for action in actions if action["targetLabel"] == output["identity"]["label"] + "_build"]
-                if action["runner"] != "remote" or action["cacheHit"] or action["exitCode"] != 0 or action["status"]:
-                    raise ValueError("Kernel build was not a successful fresh remote action")
-                if not any(item["path"] == output["name"] and item["digest"]["hash"] == output["sha256"] and int(item["digest"]["sizeBytes"]) == output["bytes"] for item in action["actualOutputs"]):
-                    raise ValueError("Kernel action and default output differ")
-            report.write_json(evidence / "kernel-builds.json", {"outputs": outputs, "actions": actions})
-            invoke("netem-smoke", ["test", "--config=tests-bare", "--test_filter=^TestFirecrackerNetem$",
-                   "--test_sharding_strategy=disabled", "--nocache_test_results", "--runs_per_test=1",
-                   "--flaky_test_attempts=1", "--test_timeout=300", SMOKE], "test", [SMOKE])
-            manifest = report.read_json(report.manifest_path(evidence / "invocation-netem-smoke/events.jsonl"))
-            logs = [row for row in manifest["reports"] if row["name"] == "test.log"]
-            xmls = [row for row in manifest["reports"] if row["name"] == "test.xml"]
-            if len(logs) != 1 or len(xmls) != 1:
-                raise ValueError("Expected one original smoke log and XML")
-            phase = evidence / "invocation-netem-smoke"
-            log = (phase / logs[0]["path"]).read_text()
-            cases = list(ET.parse(phase / xmls[0]["path"]).getroot().iter("testcase"))
-            if len(cases) != 1 or cases[0].get("name") != "TestFirecrackerNetem" or any(cases[0].find(tag) is not None for tag in ("failure", "error", "skipped")):
-                raise ValueError("Expected the one positive netem case")
-            kernel, = [row for row in outputs if row["identity"]["label"].endswith("x86_64_v6_18")]
-            identities = re.findall(r"NETEM_KERNEL sha256=([0-9a-f]{64}) bytes=([0-9]+) path=", log)
-            if identities != [(kernel["sha256"], str(kernel["bytes"]))] or "Failed to remove firecracker VM:" in log:
-                raise ValueError("Smoke used a different kernel or failed VM removal")
-            if any(marker not in log for marker in ("NETEM_ADDED", "NETEM_CHANGED", "NETEM_CLEANED")):
-                raise ValueError("Guest omitted a required netem operation")
-            report.write_json(evidence / "netem-smoke.json", {"kernel": kernel, "case": "TestFirecrackerNetem", "log": logs[0], "xml": xmls[0], "status": "PASS"})
+            if prepare_lock:
+                invoke("dependencies", ["mod", "deps", "--lockfile_mode=update"], "command", [], retain_updated_lock=True)
+            else:
+                invoke("execution-root", ["info", "output_base"], "command", [])
+                output_root = Path((evidence / "invocation-execution-root/stdout.log").read_text().strip())
+                if not output_root.is_absolute() or not output_root.is_dir():
+                    raise ValueError("Invalid native output base")
+                invoke("buildifier", ["run", "//:buildifier", "--", "-mode=check", "enterprise/server/remote_execution/containers/firecracker/BUILD"], "command", [])
+                invoke("gofmt", ["run", "//:gofmt", "--", "-d", "enterprise/server/remote_execution/containers/firecracker/netem_qualification_test.go"], "command", [])
+                if (evidence / "invocation-gofmt/stdout.log").read_bytes():
+                    raise ValueError("gofmt emitted a diff")
+                action_log = private / "kernel-actions.json"
+                built = invoke("kernels", ["build", "--noremote_accept_cached", "--execution_log_json_file=" + str(action_log), *KERNELS], "build", KERNELS)
+                groups = {(report.Owner(row["label"], row["configuration"]), "default") for row in built["expected"]}
+                outputs = report.advertised_build_outputs(evidence / "invocation-kernels/events.jsonl", groups)
+                if len(outputs) != 3:
+                    raise ValueError("Expected three canonical kernel outputs")
+                actions = []
+                with action_log.open() as stream:
+                    for _, action in execution_records(stream):
+                        if action is not None and action["targetLabel"] in [label + "_build" for label in KERNELS]:
+                            actions.append(action)
+                if {action["targetLabel"] for action in actions} != {label + "_build" for label in KERNELS} or len(actions) != 3:
+                    raise ValueError("Missing or duplicate kernel build actions")
+                for output in outputs:
+                    uri = urlsplit(output["uri"])
+                    if uri.scheme != "file" or uri.netloc not in ("", "localhost"):
+                        raise ValueError("Expected downloaded kernel output")
+                    if report.file_record(Path(unquote(uri.path))) != {key: output[key] for key in ("sha256", "bytes")}:
+                        raise ValueError("Kernel output does not match native BEP")
+                    action, = [action for action in actions if action["targetLabel"] == output["identity"]["label"] + "_build"]
+                    if action["runner"] != "remote" or action["cacheHit"] or action["exitCode"] != 0 or action["status"]:
+                        raise ValueError("Kernel build was not a successful fresh remote action")
+                    if not any(item["path"] == output["name"] and item["digest"]["hash"] == output["sha256"] and int(item["digest"]["sizeBytes"]) == output["bytes"] for item in action["actualOutputs"]):
+                        raise ValueError("Kernel action and default output differ")
+                report.write_json(evidence / "kernel-builds.json", {"outputs": outputs, "actions": actions})
+                invoke("netem-smoke", ["test", "--config=tests-bare", "--test_filter=^TestFirecrackerNetem$",
+                       "--test_sharding_strategy=disabled", "--nocache_test_results", "--runs_per_test=1",
+                       "--flaky_test_attempts=1", "--test_timeout=300", SMOKE], "test", [SMOKE])
+                manifest = report.read_json(report.manifest_path(evidence / "invocation-netem-smoke/events.jsonl"))
+                logs = [row for row in manifest["reports"] if row["name"] == "test.log"]
+                xmls = [row for row in manifest["reports"] if row["name"] == "test.xml"]
+                if len(logs) != 1 or len(xmls) != 1:
+                    raise ValueError("Expected one original smoke log and XML")
+                phase = evidence / "invocation-netem-smoke"
+                log = (phase / logs[0]["path"]).read_text()
+                cases = list(ET.parse(phase / xmls[0]["path"]).getroot().iter("testcase"))
+                if len(cases) != 1 or cases[0].get("name") != "TestFirecrackerNetem" or any(cases[0].find(tag) is not None for tag in ("failure", "error", "skipped")):
+                    raise ValueError("Expected the one positive netem case")
+                kernel, = [row for row in outputs if row["identity"]["label"].endswith("x86_64_v6_18")]
+                identities = re.findall(r"NETEM_KERNEL sha256=([0-9a-f]{64}) bytes=([0-9]+) path=", log)
+                if identities != [(kernel["sha256"], str(kernel["bytes"]))] or "Failed to remove firecracker VM:" in log:
+                    raise ValueError("Smoke used a different kernel or failed VM removal")
+                if any(marker not in log for marker in ("NETEM_ADDED", "NETEM_CHANGED", "NETEM_CLEANED")):
+                    raise ValueError("Guest omitted a required netem operation")
+                report.write_json(evidence / "netem-smoke.json", {"kernel": kernel, "case": "TestFirecrackerNetem", "log": logs[0], "xml": xmls[0], "status": "PASS"})
             completed = True
         except (OSError, ValueError, RuntimeError, TimeoutError, subprocess.SubprocessError) as error:
             runner_exit = runner_exit or 1
