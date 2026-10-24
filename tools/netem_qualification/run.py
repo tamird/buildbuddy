@@ -63,6 +63,13 @@ def main() -> int:
         if len(candidates) != 1 or not Path(candidates[0]).is_file():
             raise ValueError("Hosted wrapper omitted its native Bazel binary")
         bazel = candidates[0]
+        # Read only the UUID metadata; never copy the credential-bearing RC.
+        runner_rc = Path(os.environ["BUILDBUDDY_CI_RUNNER_ROOT_DIR"]) / "buildbuddy.bazelrc"
+        parent_ids = re.findall(
+            r"^common --build_metadata=PARENT_INVOCATION_ID=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$",
+            runner_rc.read_text(), re.MULTILINE)
+        if len(parent_ids) != 1:
+            raise ValueError("Hosted runner omitted its unique parent invocation UUID")
         rc = private / "auth.bazelrc"
         rc.write_text("common --credential_helper=remote.buildbuddy.io=" + str(auth / "helper") + "\n")
         startup = ["--nosystem_rc", "--nohome_rc", "--bazelrc=" + str(rc), "--digest_function=sha256"]
@@ -72,7 +79,7 @@ def main() -> int:
                    "--bes_results_url=https://app.buildbuddy.io/invocation/", "--remote_download_outputs=all",
                    "--lockfile_mode=error", "--noannounce_rc", "--execution_log_compact_file=",
                    "--build_event_json_file_path_conversion=false", "--remote_timeout=15m",
-                   "--build_metadata=PARENT_INVOCATION_ID=" + os.environ["BUILDBUDDY_INVOCATION_ID"],
+                   "--build_metadata=PARENT_INVOCATION_ID=" + parent_ids[0],
                    "--build_metadata=COMMIT_SHA=" + SOURCE,
                    "--build_metadata=REPO_URL=https://github.com/tamird/buildbuddy"]
         for name, expected in REPORTER_HASHES.items():
