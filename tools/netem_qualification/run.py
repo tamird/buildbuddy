@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import tarfile
+import zipfile
 import time
 import re
 import xml.etree.ElementTree as ET
@@ -156,7 +157,7 @@ def main() -> int:
                         (directory / name).write_bytes(subprocess.check_output(["git", *git_args], timeout=30))
                     (directory / "lock-after").write_bytes((workspace / "MODULE.bazel.lock").read_bytes())
                     if kind != "command":
-                        result = report.capture(raw_events, events, output_root, directory / "reports")
+                        result = report.capture(raw_events, events, output_root, directory / "reports", retain_outputs=directory.name == "invocation-tcg-smoke")
                         captured = int(bool(result["errors"]))
                 except (OSError, ValueError, subprocess.SubprocessError) as error:
                     report.write_json(directory / "capture-error.json", {"error_type": type(error).__name__})
@@ -250,7 +251,33 @@ def main() -> int:
                 log = (evidence / "invocation-tcg-smoke" / logs[0]["path"]).read_text()
                 if any(marker not in log for marker in ("test_changed_kernel_netem", "Ran 1 test", "NETEM_EXIT=0", "NETEM_ADDED", "NETEM_CHANGED", "NETEM_CLEANED", "NETEM_KERNEL sha256=" + kernel["sha256"] + " bytes=" + str(kernel["bytes"]))):
                     raise ValueError("TCG smoke omitted a required native marker")
-                report.write_json(evidence / "tcg-smoke.json", {"status": "PASS", "kernel": kernel, "log": logs[0], "scope": "QEMU TCG boot and actual qdisc control; no Firecracker or packet-rate measurement."})
+                expected_files = {"command.json", "identities.json", "qemu-version.txt", "qemu-libraries.txt", "cpio-libraries.txt", "guest.log"}
+                payloads = {}
+                for item in manifest["reports"]:
+                    path = evidence / "invocation-tcg-smoke" / item["path"]
+                    if item["name"] == "test.outputs__outputs.zip":
+                        with zipfile.ZipFile(path) as archive:
+                            if len(archive.namelist()) != len(set(archive.namelist())) or set(archive.namelist()) != expected_files:
+                                raise ValueError("Unexpected TCG native output archive")
+                            for name in expected_files:
+                                if archive.getinfo(name).file_size > 10 * 1024 * 1024:
+                                    raise ValueError("TCG native output exceeds bound")
+                                payloads[name] = archive.read(name)
+                    elif item["name"].startswith("test.outputs/"):
+                        name = item["name"].removeprefix("test.outputs/")
+                        if name not in expected_files or name in payloads:
+                            raise ValueError("Unexpected or duplicate TCG native output")
+                        payloads[name] = path.read_bytes()
+                if set(payloads) != expected_files:
+                    raise ValueError("Missing TCG native output")
+                native = evidence / "tcg-native"
+                native.mkdir()
+                for name, body in payloads.items():
+                    (native / name).write_bytes(body)
+                identities = json.loads(payloads["identities.json"])
+                if identities["kernel"] != {key: kernel[key] for key in ("sha256", "bytes")} or identities["tools"] != {key: tools_output[key] for key in ("sha256", "bytes")}:
+                    raise ValueError("TCG executed inputs differ from authenticated suppliers")
+                report.write_json(evidence / "tcg-smoke.json", {"status": "PASS", "kernel": kernel, "tools": tools_output, "identities": identities, "log": logs[0], "scope": "QEMU TCG boot and actual qdisc control; no Firecracker or packet-rate measurement."})
             else:
                 invoke("execution-root", ["info", "output_base"], "command", [])
                 output_root = Path((evidence / "invocation-execution-root/stdout.log").read_text().strip())
@@ -311,7 +338,12 @@ def main() -> int:
             report.write_json(evidence / "qualification-error.json", {"type": type(error).__name__, "message": clean(str(error).encode()).decode()})
         finally:
             if staged_kernel:
-                retained_kernel.unlink()
+                try:
+                    retained_kernel.unlink()
+                    report.write_json(evidence / "retained-kernel-cleanup.json", {"status": "PASS"})
+                except OSError as error:
+                    runner_exit = runner_exit or 1
+                    report.write_json(evidence / "retained-kernel-cleanup.json", {"status": "FAIL", "type": type(error).__name__, "message": clean(str(error).encode()).decode()})
             if not completed:
                 runner_exit = runner_exit or 1
             # Scan uncompressed evidence before it enters the sole artifact.
