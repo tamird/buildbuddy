@@ -125,6 +125,7 @@ genrule(
 )
 
 _TEST_IMAGE_X_DEFS = {
+    "netemKernelRlocationpath": "$(rlocationpath //enterprise/vmsupport/kernel:guest_kernel_x86_64_v6_18)",
     "busyboxImage": BUSYBOX_IMAGE,
     "busyboxOCIImageRlocationpath": "$(rlocationpath @busybox)",
     "dockerDindImage": DOCKER_DIND_IMAGE,
@@ -147,7 +148,10 @@ _TEST_IMAGE_X_DEFS = {
 go_test(
     name = "firecracker_test",
     timeout = "long",
-    srcs = ["firecracker_test.go"],
+    srcs = [
+        "firecracker_test.go",
+        "netem_qualification_test.go",
+    ],
     args = [
         "--executor.enable_remote_snapshot_sharing=true",
         # Uncomment to test the 6.18 kernel.
@@ -159,6 +163,7 @@ go_test(
         "//enterprise/server/remote_execution/containers/firecracker/testdata:docker_dind.ext4",
         "//enterprise/server/remote_execution/containers/firecracker/testdata:ubuntu_20_04.ext4",
         "//enterprise/server/remote_execution/containers/firecracker/testdata:ubuntu_24_04.ext4",
+        "//enterprise/vmsupport/kernel:guest_kernel_x86_64_v6_18",
         "@busybox",
     ] + select({
         "@platforms//cpu:x86_64": [
