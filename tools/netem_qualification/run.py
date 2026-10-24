@@ -221,7 +221,7 @@ def main() -> int:
                 kernel, = [row for row in outputs if row["identity"]["label"] == KERNELS[1]]
                 if kernel["sha256"] != "15e5a8edd2f5786019408d38d68084c5bd92cf6f7c44a186c2adaf1e1bf3e532" or kernel["bytes"] != 33762240:
                     raise ValueError("Unexpected retained 6.18 kernel")
-                blob = {**kernel, "uri": f"bytestream://remote.buildbuddy.io/blobs/{kernel['sha256']}/{kernel['bytes']}"}
+                blob = {**kernel, "uri": f"bytestream://remote.buildbuddy.io/rin20260818/blobs/{kernel['sha256']}/{kernel['bytes']}"}
                 fetch_retained(blob, retained_kernel)
                 staged_kernel = True
                 report.write_json(evidence / "kernel-supplier.json", {"bundle": supplier, "output": kernel, "materialized": report.file_record(retained_kernel)})
