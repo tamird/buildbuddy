@@ -222,6 +222,7 @@ func TestGuestKernelBootAndSnapshot(t *testing.T) {
 		t.Cleanup(func() { require.NoError(t, resources.Configure(true)) })
 		flags.Set(t, "executor.millicpu", int64(1000))
 		flags.Set(t, "executor.memory_bytes", int64(8e9))
+		flags.Set(t, "executor.mmap_memory_bytes", int64(64*mib))
 		require.NoError(t, resources.Configure(true))
 		size := &scpb.TaskSize{EstimatedMilliCpu: 1000, EstimatedMemoryBytes: 128 * mib}
 		shape := GenericSnapshotShape(size)
