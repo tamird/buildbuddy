@@ -691,7 +691,7 @@ func (p *Provider) buildGenericSnapshots(ctx context.Context, cgroupParent strin
 		eg.Go(func() error {
 			vmConfig := genericVMConfig(shape, fcpb.NetworkMode_NETWORK_MODE_OFF)
 			vmConfig.BootArgs = getBootArgs(vmConfig, true /*=deferRootfsMount*/)
-			p.buildGenericSnapshot(ctx, cgroupParent, nil /*=experiments*/, vmConfig)
+			p.buildGenericSnapshot(ctx, cgroupParent, "" /*=guestKernelVersion*/, nil /*=experiments*/, vmConfig)
 			return nil
 		})
 	}
@@ -699,13 +699,14 @@ func (p *Provider) buildGenericSnapshots(ctx context.Context, cgroupParent strin
 }
 
 // buildGenericSnapshot builds the generic snapshot for vmConfig and the
-// task experiments.
-func (p *Provider) buildGenericSnapshot(ctx context.Context, cgroupParent string, experiments []string, vmConfig *fcpb.VMConfiguration) {
+// requested kernel and task experiments.
+func (p *Provider) buildGenericSnapshot(ctx context.Context, cgroupParent, guestKernelVersion string, experiments []string, vmConfig *fcpb.VMConfiguration) {
 	start := time.Now()
 	err := BuildGenericSnapshot(ctx, p.env, experiments, ContainerOpts{
 		VMConfiguration:        vmConfig,
 		CgroupParent:           cgroupParent,
 		ExecutorConfig:         p.executorConfig,
+		GuestKernelVersion:     guestKernelVersion,
 		MarshalledDNSOverrides: p.marshalledDNSOverrides,
 		HostResolvConf:         p.hostResolvConf,
 	})
@@ -720,9 +721,10 @@ func (p *Provider) buildGenericSnapshot(ctx context.Context, cgroupParent string
 func (p *Provider) rebuildGenericSnapshot(c *FirecrackerContainer, cgroupParent string) {
 	hash := c.snapshotKeySet.GetWriteKey().GetConfigurationHash()
 	experiments := c.task.GetExperiments()
+	guestKernelVersion := c.requestedGuestKernelVersion
 	vmConfig := c.vmConfig.CloneVT()
 	go p.genericRebuilds.Do(p.env.GetServerContext(), hash, func(ctx context.Context) (struct{}, error) {
-		p.buildGenericSnapshot(ctx, cgroupParent, experiments, vmConfig)
+		p.buildGenericSnapshot(ctx, cgroupParent, guestKernelVersion, experiments, vmConfig)
 		return struct{}{}, nil
 	})
 }
@@ -808,6 +810,7 @@ func (p *Provider) newFromGenericSnapshot(ctx context.Context, args *container.I
 	c, err := NewContainer(ctx, p.env, args.Task.GetExecutionTask(), ContainerOpts{
 		VMConfiguration:        vmConfig,
 		GenericSnapshot:        true,
+		GuestKernelVersion:     props.GuestKernelVersion,
 		GuestMemoryLimitBytes:  sizeEstimate.GetEstimatedMemoryBytes(),
 		ContainerImage:         props.ContainerImage,
 		User:                   props.DockerUser,
