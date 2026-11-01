@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/container"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/copy_on_write"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/filecache"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/snaploader"
@@ -13,12 +14,14 @@ import (
 	"github.com/buildbuddy-io/buildbuddy/server/resources"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testcache"
 	"github.com/buildbuddy-io/buildbuddy/server/testutil/testenv"
+	"github.com/buildbuddy-io/buildbuddy/server/util/platform"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/stretchr/testify/require"
 
 	fcpb "github.com/buildbuddy-io/buildbuddy/proto/firecracker"
 	repb "github.com/buildbuddy-io/buildbuddy/proto/remote_execution"
+	scpb "github.com/buildbuddy-io/buildbuddy/proto/scheduler"
 )
 
 func TestSelectGuestKernel(t *testing.T) {
@@ -214,6 +217,61 @@ func TestGuestKernelBootAndSnapshot(t *testing.T) {
 		})
 	}
 	require.NotEqual(t, keys["5.15"], keys["6.18"], "kernel choice must separate snapshot configuration keys")
+
+	t.Run("generic snapshot lookup", func(t *testing.T) {
+		t.Cleanup(func() { require.NoError(t, resources.Configure(true)) })
+		flags.Set(t, "executor.millicpu", int64(1000))
+		flags.Set(t, "executor.memory_bytes", int64(8e9))
+		require.NoError(t, resources.Configure(true))
+		size := &scpb.TaskSize{EstimatedMilliCpu: 1000, EstimatedMemoryBytes: 128 * mib}
+		shape := GenericSnapshotShape(size)
+		require.NotNil(t, shape)
+		// Populate both kernel snapshots so an incorrect lookup returns the
+		// wrong cached VM instead of falling back to ordinary construction.
+		for _, version := range []string{"5.15", "6.18"} {
+			vmConfig := genericVMConfig(shape, fcpb.NetworkMode_NETWORK_MODE_OFF)
+			vmConfig.BootArgs = getBootArgs(vmConfig, true /*=deferRootfsMount*/)
+			c, err := NewContainer(t.Context(), env, &repb.ExecutionTask{}, ContainerOpts{
+				VMConfiguration: vmConfig, GenericSnapshot: true,
+				ExecutorConfig: cfg, GuestKernelVersion: version,
+			})
+			require.NoError(t, err)
+			prepareSnapshot(t, c)
+			require.NoError(t, c.saveSnapshot(t.Context(), &snapshotDetails{
+				memSnapshotName: "memory.snap", vmStateSnapshotName: "vmstate.snap", saveLocalSnapshot: true,
+			}))
+			key := c.snapshotKeySet.GetWriteKey().GetConfigurationHash()
+			genericSnapshots.Store(key, struct{}{})
+			t.Cleanup(func() { genericSnapshots.Delete(key) })
+		}
+		p := &Provider{env: env, executorConfig: cfg}
+		for _, tc := range []struct {
+			name, requested, want string
+			experiments           []string
+		}{
+			{name: "default", want: hash515.GetHash()},
+			{name: "explicit upgrade", requested: "6.18", want: hash618.GetHash()},
+			{name: "rollout", want: hash618.GetHash(), experiments: []string{"upgrade-fc-guest-kernel"}},
+			{name: "explicit beats rollout", requested: "5.15", want: hash515.GetHash(), experiments: []string{"upgrade-fc-guest-kernel"}},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				command, err := p.New(t.Context(), &container.Init{
+					Task: &repb.ScheduledTask{
+						ExecutionTask:      &repb.ExecutionTask{Experiments: tc.experiments},
+						SchedulingMetadata: &scpb.SchedulingMetadata{TaskSize: size},
+					},
+					Props: &platform.Properties{UseGenericSnapshot: true, GuestKernelVersion: tc.requested},
+				})
+				require.NoError(t, err)
+				c := command.(*FirecrackerContainer)
+				require.True(t, c.genericSnapshot)
+				require.Equal(t, tc.want, c.vmConfig.GuestKernelVersion)
+				manifest, err := c.loader.GetLocalManifest(c.genericSnapshotCtx(t.Context()), c.snapshotKeySet.GetWriteKey(), false)
+				require.NoError(t, err)
+				require.Equal(t, tc.want, manifest.GetVmConfiguration().GetGuestKernelVersion())
+			})
+		}
+	})
 }
 
 func TestSnapshotKernelArtifact(t *testing.T) {
