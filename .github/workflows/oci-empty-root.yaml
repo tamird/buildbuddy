@@ -1,0 +1,61 @@
+name: Verify empty OCI roots
+on:
+  push:
+    branches: [qualification/oci-empty-image-root-check]
+permissions:
+  contents: read
+jobs:
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          path: supplier
+          fetch-depth: 3
+          persist-credentials: false
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          repository: tamird/gvisor
+          ref: 75e2307ba8f512bbfe9063a88e35b0d45b44ad3a
+          path: harness
+          persist-credentials: false
+      - name: Exercise the OCI provider on the supplier's privileged native test platform
+        working-directory: supplier
+        shell: bash
+        env:
+          PRODUCT: bd7d2e4c3b3a57d1fd19da69ae3edc452aa2cc00
+          CONTROL: 656e89190ef75cb63a5dadbdb6f7085c7f7612fa
+          BASE: acaf608b95780c2b0681b0205182c38bf5b6237d
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/oci-public"
+          printf '%s\n' '{"verified":false,"status":"INCOMPLETE","reason":"source or native execution did not finish"}' > "$RUNNER_TEMP/oci-public/verdict.json"
+          cp .github/workflows/oci-empty-root.py "$RUNNER_TEMP/oci-empty-root.py"
+          git fetch --no-tags --depth=2 origin "$PRODUCT"
+          test "$(git rev-parse "$PRODUCT^")" = "$BASE"
+          test "$(git rev-parse "$CONTROL^")" = "$BASE"
+          test "$(git diff --name-only "$BASE" "$CONTROL")" = enterprise/server/remote_execution/containers/ociruntime/ociruntime_test.go
+          test "$(git diff --name-only "$CONTROL" "$PRODUCT")" = enterprise/server/remote_execution/containers/ociruntime/ociruntime.go
+          export PYTHONPATH="$GITHUB_WORKSPACE/harness/test/rbe"
+          python3 -B "$RUNNER_TEMP/oci-empty-root.py"
+      - name: Check the small artifact allowlist and omit any credential-containing report
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re
+          d = pathlib.Path(os.environ['RUNNER_TEMP'], 'oci-public')
+          allowed = {'verdict.json', 'stock.json', 'fixed.json', 'stock.xml', 'fixed.xml', 'stock.log', 'fixed.log'}
+          assert (d / 'verdict.json').is_file()
+          for f in d.iterdir():
+              assert f.name in allowed and f.is_file() and not f.is_symlink()
+              assert not re.search(rb'x-buildbuddy-api-key|github_pat_|gh[pousr]_[a-zA-Z0-9]{20,}|authorization:\s*(?:basic|bearer)\s+\S+', f.read_bytes(), re.I)
+          PY
+        id: safe
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        if: always() && steps.safe.outcome == 'success'
+        with:
+          name: oci-empty-root-native
+          path: ${{ runner.temp }}/oci-public/
+          if-no-files-found: error
