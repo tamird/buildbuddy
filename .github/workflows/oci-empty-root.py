@@ -37,6 +37,20 @@ def diagnostic(lines):
     return [s[:1000] for s in lines if re.search(r'ERROR:|FAILED:|Unexpected error|No space left|permission denied|unavailable|mount overlayfs', s, re.I)][-40:]
 
 
+def case_observations(doc, log):
+    cases = {}
+    for node in doc.iter("testcase"):
+        name = node.get("name", "")
+        fail = node.find("failure")
+        evidence = "" if fail is None else ET.tostring(fail, encoding="unicode")
+        # rules_go may leave the diagnostic in the original log rather than in the XML node.
+        block = re.search(r"(?m)^\s*--- FAIL: " + re.escape(name) + r" \([^\n]*\)\n(.*?)(?=^\s*--- (?:FAIL|PASS|SKIP):|^=== RUN|\Z)", log, re.S | re.M)
+        cases[name] = {"failed": fail is not None or node.find("error") is not None,
+                       "skipped": node.find("skipped") is not None or node.get("status") == "notrun",
+                       "matched_mount_error": ISSUE in evidence or bool(block and ISSUE in block.group(1))}
+    return cases
+
+
 def native(arm, source):
     out = ROOT / ("oci-" + arm)
     out.mkdir()
@@ -76,30 +90,27 @@ def native(arm, source):
                 shutil.copyfile(reports[key], PUBLIC / (arm + "." + ext))
         raw = [json.loads(line) for line in (out / "raw").read_text().splitlines()]
         results = [e for e in raw if "testResult" in e and e.get("id", {}).get("testResult", {}).get("label") == TARGET]
-        (result,) = results
-        r = result["testResult"]
-        rec["test_result"] = r
-        assert not (r.get("cachedLocally") or r.get("executionInfo", {}).get("cachedRemotely")) and r.get("executionInfo", {}).get("strategy") == "remote"
-        assert len(v["executed"]) == 1 and not v["missing"] and not v["errors"] and not captured["errors"]
-        doc = ET.parse(reports["test.xml"])
-        log = reports["test.log"].read_text(errors="replace")
-        cases = {}
-        for node in doc.iter("testcase"):
-            name = node.get("name", "")
-            fail = node.find("failure")
-            evidence = "" if fail is None else ET.tostring(fail, encoding="unicode")
-            # rules_go may leave the diagnostic in the original log rather than in the XML node.
-            block = re.search(r"(?m)^\s*--- FAIL: " + re.escape(name) + r" \([^\n]*\)\n(.*?)(?=^\s*--- (?:FAIL|PASS|SKIP):|^=== RUN|\Z)", log, re.S | re.M)
-            cases[name] = {"failed": fail is not None or node.find("error") is not None,
-                           "skipped": node.find("skipped") is not None or node.get("status") == "notrun",
-                           "matched_mount_error": ISSUE in evidence or bool(block and ISSUE in block.group(1))}
-        rec["cases"] = cases
+        assert results and len(v["executed"]) == len(results) and not (v["missing"] or v["errors"] or captured["errors"])
+        attempts = []
+        for event in results:
+            identity = event["id"]["testResult"]
+            result = event["testResult"]
+            assert not (result.get("cachedLocally") or result.get("executionInfo", {}).get("cachedRemotely"))
+            assert result.get("executionInfo", {}).get("strategy") == "remote"
+            paths = {report["name"]: out / report["path"] for report in captured["reports"] if report["identity"] == identity}
+            cases = case_observations(ET.parse(paths["test.xml"]), paths["test.log"].read_text(errors="replace"))
+            attempts.append({"identity": identity, "result": result, "cases": cases})
+        rec["attempts"] = attempts
         if arm == "stock":
-            rec["verified"] = (rc == 3 and v["status"] == "FAIL" and r["status"] == "FAILED"
-                               and all(cases[c] == {"failed": True, "skipped": False, "matched_mount_error": True} for c in CASES))
+            want = {"failed": True, "skipped": False, "matched_mount_error": True}
+            rec["verified"] = (rc == 3 and v["status"] == "FAIL" and all(
+                a["result"]["status"] == "FAILED" and all(a["cases"].get(c) == want for c in CASES)
+                for a in attempts))
         else:
-            rec["verified"] = (rc == 0 and v["status"] == "PASS" and r["status"] == "PASSED"
-                               and all(cases[c] == {"failed": False, "skipped": False, "matched_mount_error": False} for c in (*CASES, *CONTROLS)))
+            (attempt,) = attempts
+            want = {"failed": False, "skipped": False, "matched_mount_error": False}
+            rec["verified"] = (rc == 0 and v["status"] == "PASS" and attempt["result"]["status"] == "PASSED"
+                               and all(attempt["cases"].get(c) == want for c in (*CASES, *CONTROLS)))
     except Exception as e:
         rec["record_error"] = f"{type(e).__name__}: {e}"
     rec["recorded_at"] = now()

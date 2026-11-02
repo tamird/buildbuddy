@@ -1,0 +1,128 @@
+{
+  "base": "acaf608b95780c2b0681b0205182c38bf5b6237d",
+  "observations": {
+    "fixed": {
+      "archived_xml_sha256": "69f4ca26bf9a3947559c4b4d8d9d488ab8208f6c7c6aa1fa00ae9e0d39ab421d",
+      "attempts": [
+        {
+          "attempt": 1,
+          "remote_status": "PASSED",
+          "uncached": true,
+          "wall_time": "6.720s",
+          "xml_counts": {
+            "failed": 0,
+            "passed": 6,
+            "skipped": 0
+          }
+        }
+      ],
+      "execution_finished": "2026-11-02T10:48:35.809783+00:00",
+      "invocation": "d2f2d3ce-0f8a-48f0-b7d5-04df0595f671",
+      "native_exit": 0,
+      "original_status": "PASS",
+      "recorded_at": "2026-11-02T10:48:35.828016+00:00",
+      "retained_leaf_cases": {
+        "TestImageStoreAppliesLayerRootOwnership": {
+          "failed": false,
+          "matched_mount_error": false,
+          "skipped": false
+        },
+        "TestImageStoreExtractsWhiteouts": {
+          "failed": false,
+          "matched_mount_error": false,
+          "skipped": false
+        },
+        "TestRun": {
+          "failed": false,
+          "matched_mount_error": false,
+          "skipped": false
+        },
+        "TestRunWithEmptyRootfs/empty-layers": {
+          "failed": false,
+          "matched_mount_error": false,
+          "skipped": false
+        },
+        "TestRunWithEmptyRootfs/no-layers": {
+          "failed": false,
+          "matched_mount_error": false,
+          "skipped": false
+        }
+      },
+      "started": "2026-11-02T10:48:07.732882+00:00"
+    },
+    "stock": {
+      "archived_xml_sha256": "06e01db97e0dec1adcb55eb1cd3a112a443e4c680ea13c2b185d03ef71fc62f8",
+      "attempts": [
+        {
+          "attempt": 1,
+          "remote_status": "FAILED",
+          "uncached": true,
+          "wall_time": "7.999s",
+          "xml_counts": {
+            "failed": 3,
+            "passed": 0,
+            "skipped": 0
+          }
+        },
+        {
+          "attempt": 2,
+          "remote_status": "FAILED",
+          "uncached": true,
+          "wall_time": "7.462s",
+          "xml_counts": {
+            "failed": 3,
+            "passed": 0,
+            "skipped": 0
+          }
+        }
+      ],
+      "execution_finished": "2026-11-02T10:48:07.708618+00:00",
+      "invocation": "443f848c-bd00-4406-8bd3-eb6894507f13",
+      "native_exit": 3,
+      "original_status": "FAIL",
+      "recorded_at": "2026-11-02T10:48:07.732316+00:00",
+      "retained_leaf_cases": {
+        "TestRunWithEmptyRootfs/empty-layers": {
+          "failed": true,
+          "matched_mount_error": true,
+          "skipped": false
+        },
+        "TestRunWithEmptyRootfs/no-layers": {
+          "failed": true,
+          "matched_mount_error": true,
+          "skipped": false
+        }
+      },
+      "started": "2026-11-02T10:40:09.272727+00:00"
+    }
+  },
+  "original": {
+    "aggregate": {
+      "at": "2026-11-02T10:48:35.828417+00:00",
+      "base": "acaf608b95780c2b0681b0205182c38bf5b6237d",
+      "control_verified": false,
+      "fixed_verified": true,
+      "product": "bd7d2e4c3b3a57d1fd19da69ae3edc452aa2cc00",
+      "status": "INCOMPLETE",
+      "stock": "656e89190ef75cb63a5dadbdb6f7085c7f7612fa",
+      "verified": false
+    },
+    "artifact": 13134188134,
+    "job_finished": "2026-11-02T10:48:39Z",
+    "run": 41430613976,
+    "sha256": "02e4944e70a811e18f98f98416a5e15f3e498eba2d9e195059a1814fca48a5ec"
+  },
+  "prior_no_execution": {
+    "artifact": 13134410373,
+    "native_exits": [
+      34,
+      34
+    ],
+    "reason": "PERMISSION_DENIED: Missing API key",
+    "run": 41430046077
+  },
+  "product": "bd7d2e4c3b3a57d1fd19da69ae3edc452aa2cc00",
+  "result": "Stock failed each empty-image leaf on both native attempts. The original console retained four mount EINVAL lines; the archived XML independently binds that diagnostic to each leaf in its retained attempt. The corrected provider ran the static worker on both images and passed all three existing controls in one fresh attempt. The original aggregate rejected more than one expected negative attempt.",
+  "scope": "Original supplier OCI one-shot test observations; no new execution.",
+  "stock": "656e89190ef75cb63a5dadbdb6f7085c7f7612fa"
+}
