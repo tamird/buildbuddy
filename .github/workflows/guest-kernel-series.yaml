@@ -1,0 +1,42 @@
+name: Check packaged guest kernel series
+on:
+  push:
+    branches: [qualification/guest-kernel-shipped-series]
+permissions:
+  contents: read
+jobs:
+  native-arm:
+    if: github.repository == 'tamird/buildbuddy' && github.actor == 'tamird'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Check the two package configurations and run the ARM64 owner
+        env:
+          PRODUCT: 356d8d04c381948c4492f73f4173d4ea7c550733
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$PRODUCT"
+          test "$(uname -m)" = aarch64
+          scratch="$RUNNER_TEMP/guest-kernel-series"
+          mkdir -p "$scratch"
+          printf '{"source":"%s","phase":"setup"}\n' "$PRODUCT" > "$scratch/result.json"
+          cp .github/workflows/guest-kernel-series.py "$scratch/"
+          git switch --detach "$PRODUCT"
+          test "$(cat .bazelversion)" = 9.3.0rc2
+          curl --fail --silent --show-error --location --retry 2 \
+            https://github.com/bazelbuild/bazel/releases/download/9.3.0rc2/bazel-9.3.0rc2-linux-arm64 \
+            -o "$scratch/bazel"
+          echo "445c4ed119d073b5e70e85fda47f803ab71b1b58f0af8c21075bdd05ebbf1fd4  $scratch/bazel" | sha256sum -c -
+          chmod +x "$scratch/bazel"
+          "$scratch/bazel" --version
+          python3 "$scratch/guest-kernel-series.py" "$scratch"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: guest-kernel-series
+          path: ${{ runner.temp }}/guest-kernel-series/result.json
+          if-no-files-found: warn
