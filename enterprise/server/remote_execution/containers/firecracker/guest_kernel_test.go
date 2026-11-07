@@ -1,8 +1,10 @@
 package firecracker
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/remote_execution/copy_on_write"
@@ -41,7 +43,7 @@ func TestSelectGuestKernel(t *testing.T) {
 			cfg := &ExecutorConfig{
 				GuestKernelImagePath:     "/kernels/" + tc.defaultVersion,
 				GuestKernelVersion:       "hash-" + tc.defaultVersion,
-				GuestKernelImagePath5_15: "/kernels/5.15", GuestKernelVersion5_15: "hash-5.15",
+				baselineKernel:           guestKernel{series: "5.15", path: "/kernels/5.15", digest: "hash-5.15"},
 				GuestKernelImagePath6_18: "/kernels/6.18", GuestKernelVersion6_18: "hash-6.18",
 			}
 			if tc.unavailable {
@@ -63,6 +65,39 @@ func TestSelectGuestKernel(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, "/kernels/"+tc.want, path)
 			require.Equal(t, "hash-"+tc.want, hash)
+		})
+	}
+}
+
+func TestPackagedGuestKernelSeries(t *testing.T) {
+	// GetExecutorConfig locates these executables and hashes firecracker.
+	// Kernel selection does not start either process.
+	bin := t.TempDir()
+	for _, name := range []string{"firecracker", "jailer"} {
+		require.NoError(t, os.WriteFile(filepath.Join(bin, name), nil, 0755))
+	}
+	t.Setenv("PATH", bin)
+	cfg, err := GetExecutorConfig(t.Context(), t.TempDir(), t.TempDir())
+	require.NoError(t, err)
+
+	for _, tc := range []struct{ series, arch string }{
+		{"5.10", "arm64"},
+		{"5.15", "amd64"},
+		{"6.18", "amd64"},
+	} {
+		t.Run(tc.series, func(t *testing.T) {
+			path, hash, err := cfg.selectGuestKernel(tc.series, nil)
+			if runtime.GOARCH != tc.arch {
+				require.True(t, status.IsFailedPreconditionError(err), "%v", err)
+				return
+			}
+			require.NoError(t, err)
+			image, err := os.ReadFile(path)
+			require.NoError(t, err)
+			require.True(t, bytes.Contains(image, []byte("Linux version "+tc.series+".")), "missing Linux %s banner in %s", tc.series, path)
+			d, err := digest.Compute(bytes.NewReader(image), repb.DigestFunction_SHA256)
+			require.NoError(t, err)
+			require.Equal(t, d.GetHash(), hash)
 		})
 	}
 }
@@ -100,7 +135,7 @@ func TestGuestKernelBootAndSnapshot(t *testing.T) {
 	cfg := &ExecutorConfig{
 		JailerRoot: root, InitrdImagePath: write(t, filepath.Join(root, "initrd.cpio"), "initrd"),
 		GuestKernelImagePath: kernel515, GuestKernelVersion: hash515.GetHash(),
-		GuestKernelImagePath5_15: kernel515, GuestKernelVersion5_15: hash515.GetHash(),
+		baselineKernel:           guestKernel{series: "5.15", path: kernel515, digest: hash515.GetHash()},
 		GuestKernelImagePath6_18: kernel618, GuestKernelVersion6_18: hash618.GetHash(),
 	}
 	prepareSnapshot := func(t *testing.T, c *FirecrackerContainer) {
@@ -219,7 +254,7 @@ func TestGuestKernelBootAndSnapshot(t *testing.T) {
 func TestSnapshotKernelArtifact(t *testing.T) {
 	c := &FirecrackerContainer{
 		executorConfig: &ExecutorConfig{
-			GuestKernelImagePath: "/custom/kernel", GuestKernelImagePath5_15: "/kernels/vmlinux", GuestKernelImagePath6_18: "/kernels/vmlinux_6.18",
+			GuestKernelImagePath: "/custom/kernel", baselineKernel: guestKernel{path: "/kernels/vmlinux"}, GuestKernelImagePath6_18: "/kernels/vmlinux_6.18",
 		},
 		vmConfig: &fcpb.VMConfiguration{GuestKernelVersion: "current"},
 	}

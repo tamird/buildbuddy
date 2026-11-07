@@ -506,7 +506,7 @@ func TestParse_ExecrootPath(t *testing.T) {
 }
 
 func TestParse_GuestKernelVersion(t *testing.T) {
-	for _, version := range []string{"", "5.15", "6.18"} {
+	for _, version := range []string{"", "5.10", "5.15", "6.18"} {
 		t.Run(version, func(t *testing.T) {
 			task := &repb.ExecutionTask{Command: &repb.Command{Platform: &repb.Platform{Properties: []*repb.Platform_Property{
 				{Name: GuestKernelVersionPropertyName, Value: version},

@@ -41,11 +41,13 @@ go_library(
         "//platforms/configs:linux_x86_64": {
             "initrdRunfilePath": "$(rlocationpath //enterprise/vmsupport/bin:initrd.cpio)",
             "vmlinuxRunfilePath": "$(rlocationpath //enterprise/vmsupport/bin:vmlinux)",
+            "vmlinuxSeries": "5.15",
             "vmlinux6_18RunfilePath": "$(rlocationpath //enterprise/vmsupport/bin:vmlinux_6.18)",
         },
         "//platforms/configs:linux_arm64": {
             "initrdRunfilePath": "$(rlocationpath //enterprise/vmsupport/bin:initrd.cpio)",
             "vmlinuxRunfilePath": "$(rlocationpath //enterprise/vmsupport/bin:vmlinux)",
+            "vmlinuxSeries": "5.10",
         },
     }),
     deps = [

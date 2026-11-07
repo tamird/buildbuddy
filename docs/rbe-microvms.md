@@ -86,8 +86,8 @@ exec_properties = {
 },
 ```
 
-Supported values are `5.15` (AMD64 and ARM64) and `6.18` (AMD64 only). An explicit
-selection overrides the executor default and kernel rollout experiment. An
+ARM64 executors support `5.10`. AMD64 executors support `5.15` and `6.18`. An
+explicit selection overrides the executor default and kernel rollout experiment. An
 unsupported or unavailable version fails the action rather than falling back.
 Omitting the property retains automatic kernel selection.
 
